@@ -6,8 +6,6 @@
 # TLDR: Spam Sweepy logo until the "dev" button pops up, click it and "tempt fate", that's it!
 <img width="1876" height="86" alt="image" src="https://github.com/user-attachments/assets/b5bee15f-1d6e-46f6-8779-f6a79f443c79" />
 
-# Why pay 10k for Indog slave labour like Feirts when one API bot can get you rank 1 for free? Why spend hours a day grinding fans when a bot can do your entire month's grind in a single day?
-
 <img width="1080" height="262" alt="image" src="https://github.com/user-attachments/assets/41fb609c-9c3b-4624-a956-f38143f95b11" />
 
 T500 to T10 in 4 days btw.
