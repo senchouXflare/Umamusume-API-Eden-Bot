@@ -65,20 +65,36 @@ if (!username || !password) {
 
 const client = new SteamUser();
 
+// Hard kill after 55 s so Python's 60 s timeout gets a clean exit code
+// instead of a TimeoutExpired exception. Exit code 3 = "timed out".
+const _hardKill = setTimeout(() => {
+  process.stderr.write("TIMEOUT: Steam did not respond within 55 s\\n");
+  process.exit(3);
+}, 55000);
+_hardKill.unref(); // don't keep event loop alive on its own
+
 const loginOpts = {
   accountName: username,
   password: password,
 };
 
-if (code) {
-  loginOpts.twoFactorCode = code;
-}
-
+// Do NOT pre-set twoFactorCode: it only works for mobile-authenticator
+// accounts. Email Steam Guard needs authCode instead. Supplying the code
+// through the steamGuard callback below works for BOTH guard types.
 client.logOn(loginOpts);
 
-client.on("steamGuard", (domain, callback) => {
+let codeTried = false;
+client.on("steamGuard", (domain, callback, lastCodeWrong) => {
+  if (code && !codeTried && !lastCodeWrong) {
+    codeTried = true;
+    process.stderr.write(
+      "Submitting guard code (" + (domain ? "email:" + domain : "mobile") + ")\\n"
+    );
+    callback(code);
+    return;
+  }
   process.stderr.write(
-    "NEED_GUARD:" + (domain || "2fa") + "\\n"
+    "NEED_GUARD:" + (lastCodeWrong ? "wrong_code:" : "") + (domain || "2fa") + "\\n"
   );
   process.exit(2);
 });
@@ -278,32 +294,66 @@ def check_deps():
     if not os.path.exists(os.path.join(DIR, 'node_modules')):
         subprocess.run(['npm', 'install', '--silent'], check=True, cwd=DIR)
 
-def get_ticket(u, p, c=''):
+def get_ticket(u, p, c='', _max_retries=2):
+    """Generate a Steam session ticket for the given account.
+
+    Retries up to _max_retries times on timeout (Steam servers sometimes
+    take a long time to respond). Exits fast on Guard/auth errors.
+    """
     global LAST_TICKET_GEN_RESULT
     check_deps()
     cmd = ['node', '-e', TICKET_GEN_JS, '--', '--dummy', '--username', u, '--password', p]
-    if c: cmd += ['--code', c]
-    
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=DIR)
-    LAST_TICKET_GEN_RESULT = {
-        'stdout': proc.stdout,
-        'stderr': proc.stderr,
-        'returncode': proc.returncode,
-    }
-    if proc.returncode == 2:
-        raise Exception('STEAM_GUARD_REQUIRED')
-        
-    out = proc.stdout.strip()
-    if not out or proc.returncode != 0:
-        error_msg = proc.stderr.strip() or 'fail'
-        raise Exception(error_msg)
-        
-    line = out.split('\n')[-1]
-    try:
-        d = json.loads(line)
-        return d['steam_id'], d['session_ticket']
-    except:
-        raise Exception('bad json')
+    if c:
+        cmd += ['--code', c]
+
+    last_err = 'unknown'
+    for attempt in range(1, _max_retries + 2):  # 1-indexed, up to _max_retries+1 total tries
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=62,   # slightly above the 55 s internal JS kill
+                cwd=DIR,
+            )
+        except subprocess.TimeoutExpired:
+            last_err = f'Steam ticket gen timed out (attempt {attempt})'
+            if attempt <= _max_retries:
+                print(f'[ticket] {last_err} — retrying…')
+                continue
+            raise Exception(last_err)
+
+        LAST_TICKET_GEN_RESULT = {
+            'stdout': proc.stdout,
+            'stderr': proc.stderr,
+            'returncode': proc.returncode,
+            'attempt': attempt,
+        }
+
+        # Exit code 2 = Steam Guard required — no point retrying
+        if proc.returncode == 2:
+            if 'wrong_code' in (proc.stderr or '').lower():
+                raise Exception('STEAM_GUARD_WRONG_CODE')
+            raise Exception('STEAM_GUARD_REQUIRED')
+
+        # Exit code 3 = internal 55 s kill — retry
+        if proc.returncode == 3:
+            last_err = f'Steam did not respond within 55 s (attempt {attempt})'
+            if attempt <= _max_retries:
+                print(f'[ticket] {last_err} — retrying…')
+                continue
+            raise Exception(last_err)
+
+        out = proc.stdout.strip()
+        if not out or proc.returncode != 0:
+            raise Exception(proc.stderr.strip() or 'Steam ticket gen failed')
+
+        line = out.split('\n')[-1]
+        try:
+            d = json.loads(line)
+            return d['steam_id'], d['session_ticket']
+        except Exception:
+            raise Exception('bad json from ticket gen: ' + repr(line[:120]))
+
+    raise Exception(last_err)
 
 class UmaClient:
 
@@ -561,77 +611,107 @@ class UmaClient:
             "payload": payload,
         }, req_id)
         
-        max_retries = 8
-        for attempt in range(max_retries):
+        net_retries_left = 7
+        http5xx_retries_left = 5
+        retries_205_left = retry_205
+        retries_208_left = retry_208
+        retries_394_left = 3
+        net_attempt = 0
+        http5xx_attempt = 0
+        attempt_208 = 0
+
+        while True:
+            # --- transport layer (network errors + HTTP status) ---
             try:
                 resp = self.session.post(BASE_URL + ep, data=body, headers=headers, timeout=30)
-                break
             except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = min(1.0 + (attempt * 2.5), 15.0)
+                if net_retries_left > 0:
+                    net_retries_left -= 1
+                    wait_time = min(1.0 + (net_attempt * 2.5), 15.0)
+                    net_attempt += 1
+                    print(f"Network error on {ep}, retrying in {wait_time:.1f}s... ({net_retries_left} left)")
                     dna_sleep(wait_time, wait_time)
                     continue
                 self.api_log("ERR", ep, {"error": str(e)}, req_id)
                 raise Exception(f'Network error on {ep}: {e}')
 
-        if resp.status_code != 200:
-            body_preview = resp.text[:500] if resp.text else ""
-            self.api_log("ERR", ep, {"http_status": resp.status_code, "body": body_preview}, req_id)
-            print(f"HTTP error on {ep}: status={resp.status_code} body={body_preview}")
-            raise Exception(f'HTTP {resp.status_code} on {ep}: {body_preview}')
-            
-        res = unpack(resp.text.strip(), self.udid_str)
-        dh = res.get('data_headers', {})
-        rc = dh.get('result_code', 0)
-        
-        self.api_log("RES", ep, res, req_id)
-        
-        data = res.get('data', {})
-        if isinstance(data, dict):
-            if data.get('tp_info'):
-                self.tp_info = data['tp_info']
-            if data.get('coin_info'):
-                self.coin_info = data['coin_info']
-            if data.get('chara_info') and data['chara_info'].get('scenario_id'):
-                self.current_scenario_id = data['chara_info']['scenario_id']
-            item_list = data.get('user_item') or data.get('user_item_array')
-            if isinstance(item_list, list):
-                for item in item_list:
-                    iid = item.get('item_id')
-                    num = item.get('number')
-                    if iid is not None and num is not None:
-                        self.item_map[int(iid)] = int(num)
-        
-        if rc == 709:
-            new_vid = dh.get('viewer_id') or res.get('data', {}).get('viewer_id')
-            if new_vid and new_vid != self.viewer_id:
-                print(f"VIEWER ID MISMATCH on 709: {self.viewer_id} -> {new_vid}")
-                self.viewer_id = new_vid
-                self.regen_sid()
-            raise Exception(f'709 on {ep}')
-        if rc != 1:
-            if rc == 205 and retry_205 > 0:
-                print(f"205 on {ep}, retrying... ({retry_205} left)")
-                dna_sleep(0.14, 0.19, 0.166, 0.0083)
-                return self.call(ep, args, retry_208=retry_208, retry_205=retry_205 - 1)
+            if resp.status_code != 200:
+                body_preview = resp.text[:500] if resp.text else ""
+                if resp.status_code >= 500 and http5xx_retries_left > 0:
+                    http5xx_retries_left -= 1
+                    wait_time = min(1.0 * (2 ** http5xx_attempt), 15.0)
+                    http5xx_attempt += 1
+                    print(f"HTTP {resp.status_code} on {ep}, retrying in {wait_time:.1f}s... ({http5xx_retries_left} left)")
+                    dna_sleep(wait_time, wait_time + 0.5)
+                    continue
+                self.api_log("ERR", ep, {"http_status": resp.status_code, "body": body_preview}, req_id)
+                print(f"HTTP error on {ep}: status={resp.status_code} body={body_preview}")
+                raise Exception(f'HTTP {resp.status_code} on {ep}: {body_preview}')
 
-            if rc == 208 and retry_208 > 0:
-                if ep in {"single_mode_free/gain_skills", "single_mode_free/multi_item_exchange", "single_mode_free/multi_item_use"}:
-                    return res
+            res = unpack(resp.text.strip(), self.udid_str)
+            dh = res.get('data_headers', {})
+            rc = dh.get('result_code', 0)
 
-                if retry_208 < 6:
-                    print(f"API error 208 (SERVER BUSY) on {ep}, sleeping and retrying... (attempts left: {retry_208-1})")
-                    dna_sleep(0.6, 1.4, 1.0, 0.1)
-                return self.call(ep, args, retry_208=retry_208 - 1)
-            err_detail = format_api_error(ep, rc, res)
-            err_msg = f'API error {rc} on {ep}: {err_detail}'
-            if not (rc == 102 and ep in {"single_mode_free/race_end", "single_mode_free/race_out"}):
-                print(err_msg)
-            raise Exception(err_msg)
-        if dh.get('sid') and isinstance(dh['sid'], str) and dh['sid'].strip():
-            self.sid = next_sid(dh['sid'])
-        
-        return res
+            self.api_log("RES", ep, res, req_id)
+
+            data = res.get('data', {})
+            if isinstance(data, dict):
+                if data.get('tp_info'):
+                    self.tp_info = data['tp_info']
+                if data.get('coin_info'):
+                    self.coin_info = data['coin_info']
+                if data.get('chara_info') and data['chara_info'].get('scenario_id'):
+                    self.current_scenario_id = data['chara_info']['scenario_id']
+                item_list = data.get('user_item') or data.get('user_item_array')
+                if isinstance(item_list, list):
+                    for item in item_list:
+                        iid = item.get('item_id')
+                        num = item.get('number')
+                        if iid is not None and num is not None:
+                            self.item_map[int(iid)] = int(num)
+
+            if rc == 709:
+                new_vid = dh.get('viewer_id') or res.get('data', {}).get('viewer_id')
+                if new_vid and new_vid != self.viewer_id:
+                    print(f"VIEWER ID MISMATCH on 709: {self.viewer_id} -> {new_vid}")
+                    self.viewer_id = new_vid
+                    self.regen_sid()
+                raise Exception(f'709 on {ep}')
+
+            if rc != 1:
+                if rc == 205 and retries_205_left > 0:
+                    retries_205_left -= 1
+                    print(f"205 on {ep}, retrying... ({retries_205_left} left)")
+                    dna_sleep(0.14, 0.19, 0.166, 0.0083)
+                    continue
+
+                if rc == 394 and retries_394_left > 0:
+                    retries_394_left -= 1
+                    print(f"API error 394 on {ep}, sleeping and retrying... ({retries_394_left} left)")
+                    dna_sleep(2.5, 4.0)
+                    continue
+
+                if rc == 208 and retries_208_left > 0:
+                    if ep in {"single_mode_free/gain_skills", "single_mode_free/multi_item_exchange", "single_mode_free/multi_item_use"}:
+                        return res
+                    retries_208_left -= 1
+                    wait_min = min(0.8 * (2 ** attempt_208), 12.0)
+                    wait_max = min(wait_min * 1.6, 18.0)
+                    attempt_208 += 1
+                    print(f"API error 208 (SERVER BUSY) on {ep}, sleeping ~{wait_min:.1f}s and retrying... (attempts left: {retries_208_left})")
+                    dna_sleep(wait_min, wait_max)
+                    continue
+
+                err_detail = format_api_error(ep, rc, res)
+                err_msg = f'API error {rc} on {ep}: {err_detail}'
+                if not (rc == 102 and ep in {"single_mode_free/race_end", "single_mode_free/race_out"}):
+                    print(err_msg)
+                raise Exception(err_msg)
+
+            if dh.get('sid') and isinstance(dh['sid'], str) and dh['sid'].strip():
+                self.sid = next_sid(dh['sid'])
+
+            return res
 
     def hard_reset(self):
         self.sid = bytes(16)
@@ -731,6 +811,41 @@ class UmaClient:
             self.coin_info = coin
         return tp
 
+    # TP recovery item ("stamina/TP potion"). item_id 32 = standard TP potion.
+    TP_POTION_ITEM_ID = 32
+
+    def tp_potion_count(self, item_id=None):
+        item_id = item_id or self.TP_POTION_ITEM_ID
+        return int(self.item_map.get(int(item_id), 0))
+
+    def use_recovery_item(self, item_num=1, item_id=None):
+        """Recover TP by drinking a TP potion (item/use_recovery_item)."""
+        item_id = int(item_id or self.TP_POTION_ITEM_ID)
+        own = self.tp_potion_count(item_id)
+        result = self.call("item/use_recovery_item", {
+            "item_id": item_id,
+            "client_own_num": own,
+            "item_num": int(item_num),
+        })
+        data = result.get("data", {})
+        tp = data.get("tp_info", {})
+        if tp:
+            self.tp_info = tp
+        # refresh cached item count from response if present, else decrement locally
+        item_list = data.get("user_item") or data.get("user_item_array")
+        if isinstance(item_list, list):
+            for item in item_list:
+                iid = item.get("item_id")
+                num = item.get("number")
+                if iid is not None and num is not None:
+                    self.item_map[int(iid)] = int(num)
+        else:
+            self.item_map[item_id] = max(0, own - int(item_num))
+        coin = data.get("coin_info", {})
+        if coin:
+            self.coin_info = coin
+        return tp
+
     def read_info(self):
         return self.call('read_info/index', {
             'add_home_story_data_array': [],
@@ -744,6 +859,16 @@ class UmaClient:
         return self.call('single_mode_free/finish', {
             'is_force_delete': is_force_delete,
             'current_turn': current_turn
+        })
+
+    def remove_trained_chara(self, trained_chara_id_array: list):
+        """Delete one or more trained characters (parents) by their instance IDs.
+        Endpoint: trained_chara/remove
+        Payload:  { trained_chara_id_array: [...], viewer_id: ... }
+        viewer_id is injected automatically by call().
+        """
+        return self.call('trained_chara/remove', {
+            'trained_chara_id_array': [int(i) for i in trained_chara_id_array],
         })
 
     def load_career(self):
@@ -834,9 +959,9 @@ class UmaClient:
     def check_event(self, event_id, current_turn, chara_id=0, choice_number=0):
         payload = {
             'event_id': event_id,
-            'chara_id': chara_id or 0,
-            'choice_number': choice_number if choice_number is not None else 0,
-            'current_turn': current_turn
+            'choice_number': choice_number,
+            'chara_id': chara_id,
+            'current_turn': current_turn,
         }
         return self.call('single_mode_free/check_event', payload)
 
@@ -853,16 +978,23 @@ class UmaClient:
         })
 
     def gain_skills(self, gain_skill_info_array, current_turn):
-        gain_skill_info_array = [
-            {
-                "skill_id": item.get("skill_id"),
-                "level": item.get("level", item.get("skill_level", 1)),
-            }
-            for item in gain_skill_info_array
-        ]
         return self.call('single_mode_free/gain_skills', {
             'gain_skill_info_array': gain_skill_info_array,
             'current_turn': current_turn
+        })
+
+    def drain_events(self, current_turn):
+        return self.call('single_mode_free/check_event', {
+            'event_id': 0,
+            'choice_number': 0,
+            'chara_id': 0,
+            'current_turn': current_turn,
+        })
+
+    def race_progress(self, current_turn, is_short=False):
+        return self.call('single_mode_free/race_progress', {
+            'current_turn': current_turn,
+            'is_short': is_short
         })
 
     def race_entry(self, program_id, current_turn, running_style=None):
@@ -902,3 +1034,4 @@ class UmaClient:
             'add_race_array': add_race_array or [],
             'cancel_race_array': cancel_race_array or []
         })
+# end of UmaClient

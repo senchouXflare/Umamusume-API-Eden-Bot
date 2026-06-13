@@ -26,7 +26,8 @@ import frida
 from career_bot import master_data
 from career_bot.presets import PresetStore
 from career_bot.runner import CareerRunner
-from uma_api.client import UmaClient, get_ticket
+from uma_api.client import UmaClient, get_ticket, LAST_TICKET_GEN_RESULT as _ltkr_ref
+import uma_api.client as _uma_client_mod
 
 PROCESS_NAME = "UmamusumePrettyDerby.exe"
 APP_ID = "3224770"
@@ -302,6 +303,7 @@ active_parent_rank_points = {}
 pending_game_auth_config = {}
 raw_load_index_response = None
 active_selection = {"deck": None, "friend": None, "trainee": None, "veterans": []}
+state_lock = threading.Lock()  # guards cross-thread mutation of active_* globals
 turn_delay_min_sec = 2.5
 turn_delay_max_sec = 5.0
 turn_delay_restore_min_sec = 2.5
@@ -376,6 +378,43 @@ def get_turn_delay():
         "restore_max": turn_delay_restore_max_sec,
         "disabled": turn_delay_disabled,
     }
+
+
+SETTINGS_PATH = os.path.join(DIR, "settings.json")
+TP_RECOVERY_MODES = ("potion_first", "potion_only", "jewels_only")
+
+
+def _read_settings():
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_settings(data):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        return True
+    except Exception as e:
+        print(f"Failed to write settings.json: {e}")
+        return False
+
+
+def load_tp_recovery_mode():
+    mode = _read_settings().get("tp_recovery", "potion_first")
+    return mode if mode in TP_RECOVERY_MODES else "potion_first"
+
+
+def set_tp_recovery_mode(mode):
+    if mode not in TP_RECOVERY_MODES:
+        mode = "potion_first"
+    data = _read_settings()
+    data["tp_recovery"] = mode
+    _write_settings(data)
+    return mode
 
 
 import hashlib
@@ -734,12 +773,12 @@ def parent_rank_point(parent_id):
 
 
 def selected_succession_rank_point(req):
-    selected_total = parent_rank_point(req.parent_id_1) + parent_rank_point(
-        req.parent_id_2
-    )
-    if selected_total:
+    p1_pt = parent_rank_point(req.parent_id_1)
+    p2_pt = parent_rank_point(req.parent_id_2)
+    selected_total = p1_pt + p2_pt
+    if selected_total in (0, 124):
         return selected_total
-    return active_start_state.get("succession_rank_point", 0)
+    return 0
 
 
 skill_data = {}
@@ -887,16 +926,36 @@ def get_item_count(item_list, item_id):
     return 0
 
 
+def find_item_count(item_list, item_id):
+    """Like get_item_count but returns None when the item is absent.
+
+    Career responses often carry a PARTIAL user_item_array (career-scoped
+    items only); an absent item means "unchanged", NOT zero.
+    """
+    for item in item_list or []:
+        if item.get("item_id") == item_id:
+            return int(item.get("number") or 0)
+    return None
+
+
 def get_account_status(data, career_data=None):
     tp_info = data.get("tp_info") or (active_client.tp_info if active_client else {})
     coin_info = data.get("coin_info") or (
         active_client.coin_info if active_client else {}
     )
     item_list = data.get("item_list") or data.get("user_item_array")
-    if item_list is None:
-        gold = active_client.item_map.get(59, 0) if active_client else 0
-    else:
-        gold = get_item_count(item_list, 59)
+    # Only trust the list for items it actually contains; otherwise fall back
+    # to the client cache (call() keeps it fresh from every response).
+    cache = active_client.item_map if active_client else {}
+    gold_seen = find_item_count(item_list, 59)
+    potions_seen = find_item_count(item_list, 32)
+    gold = gold_seen if gold_seen is not None else cache.get(59, 0)
+    potions = potions_seen if potions_seen is not None else cache.get(32, 0)
+    if active_client:
+        if gold_seen is not None:
+            active_client.item_map[59] = gold_seen
+        if potions_seen is not None:
+            active_client.item_map[32] = potions_seen
     career = data.get("single_mode_chara_light") or None
 
     if career_data:
@@ -917,6 +976,7 @@ def get_account_status(data, career_data=None):
             "total": (coin_info.get("fcoin", 0) or 0) + (coin_info.get("coin", 0) or 0),
         },
         "gold": gold,
+        "potions": potions,
         "clocks": active_client.item_map.get(95, 0) if active_client else 0,
         "career": None,
     }
@@ -1059,6 +1119,21 @@ class RunCareerRequest(BaseModel):
 
 class SaveRacesRequest(BaseModel):
     races: list[int]
+    preset_name: str = ""
+
+
+def resolve_preset(preset_name=""):
+    """Resolve a preset by name with sane fallbacks (no hardcoded preset)."""
+    name = (preset_name or "").strip()
+    if name:
+        preset = preset_store.read_one(name)
+        if preset:
+            return preset
+    preset = preset_store.read_one("xguri parent")
+    if preset:
+        return preset
+    all_presets = preset_store.read_all() or []
+    return all_presets[0] if all_presets else None
 
 
 class SavePresetRequest(BaseModel):
@@ -1102,6 +1177,27 @@ async def set_turn_delay_settings(req: ApiDelayRequest):
     return set_turn_delay(req.min, req.max, req.disabled)
 
 
+class TpRecoveryRequest(BaseModel):
+    mode: str = "potion_first"
+
+
+@app.get("/api/settings/tp-recovery")
+async def get_tp_recovery_settings():
+    mode = load_tp_recovery_mode()
+    potions = None
+    if active_client is not None:
+        try:
+            potions = active_client.tp_potion_count()
+        except Exception:
+            potions = None
+    return {"success": True, "mode": mode, "modes": list(TP_RECOVERY_MODES), "potions": potions}
+
+
+@app.post("/api/settings/tp-recovery")
+async def set_tp_recovery_settings(req: TpRecoveryRequest):
+    return {"success": True, "mode": set_tp_recovery_mode(req.mode)}
+
+
 @app.get("/api/master-data/status")
 async def master_data_status():
     return master_data.status(base_dir)
@@ -1134,12 +1230,12 @@ async def generate_master_data():
 
 @app.post("/api/presets/save_races")
 async def save_races(req: SaveRacesRequest):
-    preset = preset_store.read_one("xguri parent")
+    preset = resolve_preset(req.preset_name)
     if not preset:
-        return {"success": False, "detail": "xguri parent preset missing"}
+        return {"success": False, "detail": "no preset available"}
     preset["extra_race_list"] = req.races
     preset_store.write(preset)
-    return {"success": True}
+    return {"success": True, "preset": preset.get("name")}
 
 
 @app.get("/api/presets")
@@ -1192,7 +1288,39 @@ def start_career_from_request(req):
 
     tp_info = active_start_state["tp_info"]
     current_tp = int(tp_info.get("current_tp") or 0)
-    if req.use_tp and current_tp < req.use_tp:
+
+    # TP recovery. Modes (settings.json -> "tp_recovery"):
+    #   "potion_first" (default): drink TP potions first, fall back to jewels
+    #   "potion_only": only use potions
+    #   "jewels_only": only spend jewels (legacy behavior)
+    tp_mode = load_tp_recovery_mode()
+
+    if req.use_tp and current_tp < req.use_tp and tp_mode in ("potion_first", "potion_only"):
+        for _ in range(20):  # cap potions per start
+            if current_tp >= req.use_tp:
+                break
+            if active_client.tp_potion_count() <= 0:
+                break
+            try:
+                active_client.use_recovery_item(item_num=1)
+                tp_info = active_client.tp_info
+                active_start_state["tp_info"] = tp_info
+                new_tp = int(tp_info.get("current_tp") or 0)
+                if new_tp <= current_tp:
+                    break  # potion gave nothing (full or server refused) -> stop looping
+                current_tp = new_tp
+            except Exception as e:
+                if "213" in str(e):
+                    try:
+                        res = active_client.call("load/index", {"adid": ""})
+                        active_client.refresh_cached_account_state(res.get("data", {}))
+                    except Exception:
+                        pass
+                else:
+                    break
+                time.sleep(1)
+
+    if req.use_tp and current_tp < req.use_tp and tp_mode in ("potion_first", "jewels_only"):
         for attempt in range(3):
             try:
                 needed = ((req.use_tp - current_tp) + 29) // 30
@@ -1280,6 +1408,29 @@ async def login(req: LoginRequest):
         chara = None
         cfg = dict(pending_game_auth_config)
         pending_game_auth_config = {}
+
+        # Fallback: if startup auto-login already consumed pending_game_auth_config,
+        # reload game-auth fields from the saved auth_config.json so that
+        # manual web-UI logins still work without re-running Frida capture.
+        if not has_fresh_auth_config(cfg):
+            _saved_path = os.path.join(RUNTIME_DIR, "auth_config.json")
+            if os.path.exists(_saved_path):
+                try:
+                    with open(_saved_path, "r") as _f:
+                        _saved = json.load(_f)
+                    # Deobfuscate creds stored by previous login
+                    if "steam_username" in _saved:
+                        _saved["steam_username"] = _deobfuscate_creds(_saved["steam_username"])
+                    if "steam_password_seed" in _saved:
+                        _saved["steam_password_seed"] = _deobfuscate_creds(_saved["steam_password_seed"])
+                    # Merge game-auth fields only (never override steam ticket from form)
+                    for _k in ("app_ver", "res_ver", "auth_key", "auth_key_len",
+                               "viewer_id", "udid", "device_id"):
+                        if _k in _saved and _k not in cfg:
+                            cfg[_k] = _saved[_k]
+                    print("[login] Restored game-auth fields from saved auth_config.json", flush=True)
+                except Exception as _e:
+                    print(f"[login] Could not restore auth_config.json: {_e}", flush=True)
 
         active_client = None
         active_account = None
@@ -1542,6 +1693,7 @@ async def login(req: LoginRequest):
                     "card_id": cid,
                     "name": chara_map.get(cid, f"Unknown ({cid})"),
                     "rank": chara.get("rank", 0),
+                    "create_date": chara.get("create_date") or chara.get("created_at") or 0,
                     "tree": tree,
                 }
             )
@@ -1553,7 +1705,7 @@ async def login(req: LoginRequest):
             active_parent_cards[int(chara.get("trained_chara_id"))] = lineage_cards
             active_parent_rank_points[int(chara.get("trained_chara_id"))] = {
                 "rank": chara.get("rank", 0),
-                "rank_score": chara.get("rank_score", 0),
+                "rank_point": chara.get("rank_score", 0),
             }
 
         active_dashboard_data = {
@@ -1567,6 +1719,13 @@ async def login(req: LoginRequest):
         return active_dashboard_data
     except Exception as e:
         msg = str(e)
+        if "STEAM_GUARD_WRONG_CODE" in msg:
+            pending_game_auth_config = cfg
+            return {
+                "success": False,
+                "needs_2fa": True,
+                "detail": "WRONG GUARD CODE - GET A FRESH CODE AND RETRY",
+            }
         if "STEAM_GUARD_REQUIRED" in msg:
             pending_game_auth_config = cfg
             return {"success": False, "needs_2fa": True}
@@ -1705,6 +1864,11 @@ async def get_club_by_member(trainer_id: int):
         return {"success": False, "detail": str(e)}
 
 
+@app.get("/api/skills")
+async def get_skills():
+    return {"success": True, "skills": skill_data}
+
+
 @app.get("/api/session")
 async def session_status():
     global active_client, active_dashboard_data, active_account, active_selection
@@ -1813,8 +1977,9 @@ def manage_career_loop(req, preset, initial_result):
                         time.sleep(1)
                     continue
                 current_result = started["result"]
-                account, chara_info = apply_career_result(current_result)
-                active_account = account
+                with state_lock:
+                    account, chara_info = apply_career_result(current_result)
+                    active_account = account
                 started_ok = True
                 consecutive_fails = 0
             except Exception as e:
@@ -1832,18 +1997,19 @@ def manage_career_loop(req, preset, initial_result):
 
 @app.post("/api/career/run")
 async def run_career(req: RunCareerRequest):
-    global active_account, backend_loop_thread
+    global active_account, backend_loop_thread, backend_loop_stop
     if career_runner.snapshot().get("running") or (
         backend_loop_thread and backend_loop_thread.is_alive()
     ):
         return {"success": False, "detail": "Career runner loop already active"}
-    preset = preset_store.read_one("xguri parent")
+    preset = resolve_preset(req.preset_name)
     if not preset:
-        return {"success": False, "detail": "xguri parent preset missing"}
+        return {"success": False, "detail": "no preset available"}
     req.scenario_id = int(preset.get("scenario_id") or 4)
     try:
         account = active_account or {}
         career = account.get("career") or {}
+        load_data = {}
         if career.get("active"):
             index_result = active_client.call("load/index")
             load_data = index_result.get("data", {})
@@ -1911,7 +2077,25 @@ async def run_career(req: RunCareerRequest):
 
 @app.get("/api/career/runner")
 async def career_runner_status():
-    return {"success": True, "runner": career_runner.snapshot()}
+    payload = {"success": True, "runner": career_runner.snapshot()}
+    # Overlay live wallet/TP/item values from the client cache so the UI
+    # account strip stays fresh while the runner loop is active.
+    if active_account and active_client:
+        acct = dict(active_account)
+        tp = active_client.tp_info or {}
+        coin = active_client.coin_info or {}
+        fcoin = coin.get("fcoin", 0) or 0
+        pcoin = coin.get("coin", 0) or 0
+        acct["tp"] = {
+            "current": tp.get("current_tp", 0),
+            "max": tp.get("max_tp", 0),
+        }
+        acct["carrots"] = {"free": fcoin, "paid": pcoin, "total": fcoin + pcoin}
+        acct["gold"] = active_client.item_map.get(59, 0)
+        acct["potions"] = active_client.item_map.get(32, 0)
+        acct["clocks"] = active_client.item_map.get(95, 0)
+        payload["account"] = acct
+    return payload
 
 
 @app.post("/api/career/runner/stop")
@@ -2033,6 +2217,90 @@ async def delete_career(req: DeleteCareerRequest):
         return {"success": False, "detail": str(e)}
 
 
+class RemoveParentsRequest(BaseModel):
+    trained_chara_ids: list  # list of int instance IDs to delete
+
+
+def _evict_parents(ids: list):
+    """Remove ids from all in-memory caches. Call while holding no lock."""
+    global active_dashboard_data, active_parent_cards, active_parent_rank_points
+    for cid in ids:
+        active_parent_cards.pop(cid, None)
+        active_parent_rank_points.pop(cid, None)
+    if active_dashboard_data:
+        parents = active_dashboard_data.get("parents") or []
+        active_dashboard_data["parents"] = [
+            p for p in parents if int(p.get("instance_id") or -1) not in ids
+        ]
+
+
+@app.post("/api/parents/remove")
+async def remove_parents(req: RemoveParentsRequest):
+    """Delete one or more trained characters (parents) by instance ID."""
+    global active_client
+    if not active_client:
+        return {"success": False, "detail": "Not logged in"}
+    if not req.trained_chara_ids:
+        return {"success": False, "detail": "No IDs provided"}
+    ids = [int(i) for i in req.trained_chara_ids]
+    try:
+        result = active_client.remove_trained_chara(ids)
+        _evict_parents(ids)
+        return {"success": True, "removed": len(ids), "result": result}
+    except Exception as e:
+        return {"success": False, "detail": str(e)}
+
+
+class RemoveRecentParentsRequest(BaseModel):
+    max_age_hours: float = 24.0   # delete parents created within this many hours
+
+
+@app.post("/api/parents/remove-recent")
+async def remove_recent_parents(req: RemoveRecentParentsRequest):
+    """Auto-delete all parents whose create_date is within max_age_hours of now.
+    Uses the in-memory dashboard cache so no extra API call needed.
+    """
+    global active_client, active_dashboard_data
+    if not active_client:
+        return {"success": False, "detail": "Not logged in"}
+    if not active_dashboard_data:
+        return {"success": False, "detail": "Dashboard not loaded — please refresh"}
+
+    import time
+    cutoff = time.time() - req.max_age_hours * 3600
+    parents = active_dashboard_data.get("parents") or []
+
+    candidates = [
+        int(p["instance_id"])
+        for p in parents
+        if int(p.get("instance_id") or 0) > 0
+        and int(p.get("create_date") or 0) >= cutoff
+    ]
+
+    if not candidates:
+        return {"success": True, "removed": 0, "detail": "No parents found within the time window"}
+
+    try:
+        result = active_client.remove_trained_chara(candidates)
+        _evict_parents(candidates)
+        return {"success": True, "removed": len(candidates), "ids": candidates, "result": result}
+    except Exception as e:
+        return {"success": False, "detail": str(e)}
+
+
+@app.get("/api/debug/last_ticket")
+async def get_last_ticket_result():
+    """Returns the raw stdout/stderr/returncode from the last Steam ticket gen attempt."""
+    result = _uma_client_mod.LAST_TICKET_GEN_RESULT
+    if result is None:
+        return {"detail": "No ticket gen attempt recorded yet"}
+    safe = dict(result)
+    # redact the actual ticket value from stdout
+    if safe.get("stdout"):
+        safe["stdout"] = safe["stdout"][:80] + "...<redacted>"
+    return safe
+
+
 @app.get("/api/debug/start_state")
 async def get_start_state():
     return active_start_state
@@ -2043,9 +2311,130 @@ async def get_raw_load():
     return {"error": "raw load/index response storage disabled"}
 
 
+def safe_public_path(subdir: str, file_name: str):
+    """Resolve a file inside public/<subdir>, refusing path traversal."""
+    base = (base_dir / "public" / subdir).resolve()
+    try:
+        path = (base / file_name).resolve()
+    except (OSError, ValueError):
+        return None
+    if base != path and base not in path.parents:
+        return None
+    return path if path.is_file() else None
+
+
+@app.post("/api/career/rescue")
+async def rescue_career():
+    """Probe ladder to clear a stuck single-mode state (e.g. playing_state=3
+    with the race already recorded, where race_end/race_out/exec_command all
+    return 102). Run while logged in and with the runner STOPPED."""
+    if not active_client:
+        return {"success": False, "detail": "Not logged in"}
+    if career_runner.snapshot().get("running"):
+        return {"success": False, "detail": "Stop the career runner first"}
+
+    report = []
+
+    def snap():
+        res = active_client.load_career()
+        d = res.get("data") or {}
+        ch = d.get("chara_info") or {}
+        return {
+            "turn": ch.get("turn"),
+            "playing_state": ch.get("playing_state"),
+            "vital": ch.get("vital"),
+            "race_program_id": ch.get("race_program_id"),
+            "has_race_start_info": bool(d.get("race_start_info")),
+            "events": len(d.get("unchecked_event_array") or []),
+        }
+
+    try:
+        st0 = snap()
+    except Exception as e:
+        return {"success": False, "detail": f"load failed: {e}", "report": report}
+    report.append({"step": "initial", "state": st0})
+    start_turn = int(st0.get("turn") or 0)
+    vital = int(st0.get("vital") or 0)
+    if st0.get("playing_state") == 1:
+        return {"success": True, "detail": "career is not stuck", "report": report}
+
+    t = start_turn
+
+    def probe(label, fn):
+        row = {"step": label}
+        try:
+            fn()
+            row["call"] = "ok"
+        except Exception as e:
+            row["call"] = str(e)[:200]
+        try:
+            row["state"] = snap()
+        except Exception as e:
+            row["state"] = {"error": str(e)[:120]}
+        report.append(row)
+        st = row.get("state") or {}
+        ps = st.get("playing_state")
+        turn_now = int(st.get("turn") or 0)
+        return ps == 1 or turn_now > start_turn
+
+    probes = [
+        ("race_out turn", lambda: active_client.race_out(current_turn=t)),
+        ("race_out turn+1", lambda: active_client.race_out(current_turn=t + 1)),
+        ("race_end turn+1", lambda: active_client.race_end(current_turn=t + 1)),
+        ("race_end+out turn", lambda: (active_client.race_end(current_turn=t), active_client.race_out(current_turn=t))),
+        ("race_start+end+out turn", lambda: (
+            active_client.race_start(is_short=1, current_turn=t),
+            active_client.race_end(current_turn=t),
+            active_client.race_out(current_turn=t),
+        )),
+        ("race_start+end+out turn+1", lambda: (
+            active_client.race_start(is_short=1, current_turn=t + 1),
+            active_client.race_end(current_turn=t + 1),
+            active_client.race_out(current_turn=t + 1),
+        )),
+        ("rest turn+1", lambda: active_client.exec_command(command_type=7, command_id=701, current_turn=t + 1, current_vital=vital)),
+    ]
+    try:
+        for label, fn in probes:
+            if probe(label, fn):
+                return {"success": True, "detail": f"unstuck via: {label}", "report": report}
+    except Exception as e:
+        return {"success": False, "detail": str(e), "report": report}
+    return {"success": False, "detail": "still stuck after all probes", "report": report}
+
+
+@app.get("/api/career/history")
+async def career_history():
+    snap = career_runner.snapshot()
+    history = snap.get("action_history") or []
+    return {
+        "success": True,
+        "turns": snap.get("date_history") or [],
+        "scores": snap.get("score_history") or [],
+        "stats": [
+            {"turn": row.get("turn"), "action": row.get("action"), **(row.get("stats") or {})}
+            for row in history
+        ],
+        "running": snap.get("running"),
+        "finished": snap.get("finished"),
+    }
+
+
+@app.get("/api/career/crash_trace")
+async def career_crash_trace():
+    trace_path = Path(RUNTIME_DIR) / "crash_trace.txt"
+    if not trace_path.exists():
+        return {"success": True, "trace": ""}
+    try:
+        text = trace_path.read_text(encoding="utf-8", errors="replace")
+        return {"success": True, "trace": text[-8000:]}
+    except Exception as e:
+        return {"success": False, "detail": str(e)}
+
+
 @app.get("/api/images/{image_name}")
 async def get_image(image_name: str):
-    name_no_ext = image_name.split("?")[0].replace(".png", "")
+    name_no_ext = Path(image_name.split("?")[0].replace(".png", "")).name
 
     exact_path = images_dir / f"{name_no_ext}.png"
     if exact_path.exists():
@@ -2107,18 +2496,40 @@ async def broom_png():
 
 @app.get("/assets/data/{file_name}")
 async def get_asset_data(file_name: str):
-    path = base_dir / "public" / "assets" / "data" / file_name
-    if path.exists():
+    path = safe_public_path("assets/data", file_name)
+    if path:
         return FileResponse(path, headers={"Cache-Control": "no-cache"})
     raise HTTPException(status_code=404, detail="File not found")
 
 
 @app.get("/races/{file_name}")
 async def get_race_image(file_name: str):
-    path = base_dir / "public" / "races" / file_name
-    if path.exists():
+    path = safe_public_path("races", file_name)
+    if path:
         return FileResponse(path, headers={"Cache-Control": "max-age=31536000"})
     raise HTTPException(status_code=404, detail="Race image not found")
+
+
+@app.get("/css/{file_name}")
+async def get_css_module(file_name: str):
+    path = safe_public_path("css", file_name)
+    if path and path.suffix == ".css":
+        return FileResponse(
+            path, media_type="text/css", headers={"Cache-Control": "no-cache"}
+        )
+    raise HTTPException(status_code=404, detail="CSS module not found")
+
+
+@app.get("/js/{file_name}")
+async def get_js_module(file_name: str):
+    path = safe_public_path("js", file_name)
+    if path and path.suffix == ".js":
+        return FileResponse(
+            path,
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
+    raise HTTPException(status_code=404, detail="JS module not found")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2242,13 +2653,11 @@ def check_saved_auth():
                     saved_cfg["steam_password_seed"]
                 )
 
-            # First, try with the saved ticket
             if (
                 has_fresh_auth_config(saved_cfg)
                 and "steam_id" in saved_cfg
                 and "steam_session_ticket" in saved_cfg
             ):
-                # Apply spoofed hardware info if present (DO NOT override 'udid' or 'device_id' as it breaks auth crypto/binding)
                 for key in [
                     "device_name",
                     "graphics_device_name",
@@ -2270,7 +2679,6 @@ def check_saved_auth():
                 else:
                     print("[-] Headless bypass failed (Invalid session).", flush=True)
 
-            # If that failed, try to get a new ticket if we have credentials
             if saved_cfg.get("steam_username") and saved_cfg.get("steam_password_seed"):
                 print("[+] Attempting to refresh Steam session ticket...", flush=True)
                 try:
@@ -2411,7 +2819,6 @@ if __name__ == "__main__":
     if not refresh_auth_before_serving():
         raise SystemExit(1)
 
-    # AUTO LOGIN IF WE HAVE SAVED CREDS AND BYPASSED
     if pending_game_auth_config.get("steam_id") and pending_game_auth_config.get(
         "steam_session_ticket"
     ):
@@ -2419,7 +2826,6 @@ if __name__ == "__main__":
         backup_cfg = dict(pending_game_auth_config)
         try:
             import asyncio
-
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             res = loop.run_until_complete(login(LoginRequest()))

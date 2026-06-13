@@ -56,13 +56,27 @@ class MantStrategy(ScenarioStrategy):
             return Decision("finish", {"current_turn": chara["turn"]}, "ready to finish")
         race = data.get("race_start_info")
         playing_state = (chara.get("playing_state") or 0)
+        # Stale in-race flags: if the race for THIS turn is already recorded in
+        # race_history (e.g. race_out response was lost to an HTTP 500), the server
+        # keeps playing_state=3 and race_start_info around while race_end/race_out
+        # return 102 forever. Detect that and continue the turn normally.
+        current_turn = int(chara.get("turn") or 0)
+        race_pid = int(chara.get("race_program_id") or (race or {}).get("program_id") or 0)
+        race_already_done = bool(race_pid) and any(
+            int((row or {}).get("program_id") or -1) == race_pid
+            and int((row or {}).get("turn") or -1) == current_turn
+            for row in (data.get("race_history") or [])
+        )
+        if race_already_done and playing_state in (2, 3, 4):
+            playing_state = 1
+            race = None
         if playing_state == 3:
             return Decision("race_progress", {"current_turn": chara["turn"], "phase": "start", "race_start_info": race, "chara_info": chara}, "resume race start")
         if playing_state == 5:
-            return Decision("finish", {"current_turn": chara["turn"]}, "goal failed / career end")     
+            return Decision("finish", {"current_turn": chara["turn"]}, "goal failed / career end")
         if race and race.get("program_id") and playing_state in (2, 4):
             return Decision("race_progress", {"current_turn": chara["turn"], "phase": "start", "race_start_info": race, "chara_info": chara}, "race start")
-        if self.race_planner:
+        if self.race_planner and not race_already_done:
             forced_program_id = self.race_planner.forced_program(state)
             if forced_program_id:
                 return Decision("race", {"program_id": forced_program_id, "current_turn": chara["turn"], "_strategy": self}, self.race_planner.label(forced_program_id))

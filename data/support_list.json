@@ -614,6 +614,11 @@
     "rarity": "SR",
     "type": "Stamina"
   },
+  "20048": {
+    "name": "Oguri Cap",
+    "rarity": "SR",
+    "type": "Guts"
+  },
   "30001": {
     "name": "Special Week",
     "rarity": "SSR",
@@ -844,6 +849,11 @@
     "rarity": "SSR",
     "type": "Guts"
   },
+  "30053": {
+    "name": "Taiki Shuttle",
+    "rarity": "SSR",
+    "type": "Speed"
+  },
   "30054": {
     "name": "Nice Nature",
     "rarity": "SSR",
@@ -1058,5 +1068,35 @@
     "name": "Mr. C.B.",
     "rarity": "SSR",
     "type": "Wisdom"
+  },
+  "30098": {
+    "name": "Haru Urara",
+    "rarity": "SSR",
+    "type": "Power"
+  },
+  "30099": {
+    "name": "Ikuno Dictus",
+    "rarity": "SSR",
+    "type": "Stamina"
+  },
+  "30100": {
+    "name": "Rice Shower",
+    "rarity": "SSR",
+    "type": "Wisdom"
+  },
+  "30102": {
+    "name": "El Condor Pasa",
+    "rarity": "SSR",
+    "type": "Guts"
+  },
+  "30103": {
+    "name": "Matikanetannhauser",
+    "rarity": "SSR",
+    "type": "Wisdom"
+  },
+  "30104": {
+    "name": "Zenno Rob Roy",
+    "rarity": "SSR",
+    "type": "Stamina"
   }
 }

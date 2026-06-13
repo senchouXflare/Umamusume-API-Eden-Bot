@@ -12,10 +12,10 @@
     </script>
     <title>Sweepy改二</title>
     <link rel="stylesheet" href="styles.css">
-
+    <link rel="stylesheet" href="/css/shell.css?v=5">
 </head>
-<body>
-        <div id="loading-screen" class="loading-screen">
+<body class="shell-v2">
+    <div id="loading-screen" class="loading-screen">
         <div class="loading-shell">
             <div class="loading-art">
                 <div class="loading-broom-aura"></div>
@@ -28,7 +28,7 @@
     <div id="app">
         <header class="navbar">
             <div class="navbar-title">
-                <h1 id="theme-toggle" class="title">SWEEPY<span>改二</span></h1>
+                <h1 id="theme-toggle" class="title" title="Click to switch accent theme">SWEEPY<span>改二</span></h1>
             </div>
 
             <div class="navbar-main">
@@ -37,9 +37,9 @@
                 <div id="turn-delay-control" class="turn-delay-control">
                     <div class="delay-group">
                         <span class="turn-delay-label">DELAY(S)</span>
-                        <input id="turn-delay-min" class="turn-delay-input" type="number" min="0" step="0.1" value="1.6">
+                        <input id="turn-delay-min" class="turn-delay-input" type="number" min="0" step="0.1" value="1.6" aria-label="Minimum turn delay seconds">
                         <span class="turn-delay-separator">–</span>
-                        <input id="turn-delay-max" class="turn-delay-input" type="number" min="0" step="0.1" value="3.7">
+                        <input id="turn-delay-max" class="turn-delay-input" type="number" min="0" step="0.1" value="3.7" aria-label="Maximum turn delay seconds">
                     </div>
                     <div class="control-btns">
                         <button id="tempt-fate-btn" class="btn btn-sm turn-delay-button" type="button">TEMPT FATE</button>
@@ -53,24 +53,29 @@
                 <button id="logout-btn" class="btn btn-sm logout-btn" style="display:none">LOGOUT</button>
             </div>
         </header>
+
         <main class="main-container">
             <div id="login-view" class="login-wrapper">
                 <div class="login-panel">
+                    <div class="login-head">
+                        <div class="login-title">Welcome back</div>
+                        <div class="login-sub">Sign in with your Steam account to start sweeping.</div>
+                    </div>
                     <form id="login-form" autocomplete="on">
                         <div id="standard-fields">
                             <div class="form-group">
                                 <label class="form-label" for="username">STEAM USERNAME</label>
-                                <input id="username" name="username" type="text" class="form-input" placeholder="..." autocomplete="username">
+                                <input id="username" name="username" type="text" class="form-input" placeholder="username" autocomplete="username">
                             </div>
                             <div class="form-group">
                                 <label class="form-label" for="password">STEAM PASSWORD</label>
-                                <input id="password" name="password" type="password" class="form-input" placeholder="..." autocomplete="current-password">
+                                <input id="password" name="password" type="password" class="form-input" placeholder="••••••••" autocomplete="current-password">
                             </div>
                         </div>
                         <div id="2fa-fields" style="display:none">
                             <div class="form-group">
                                 <label class="form-label" for="code">STEAM GUARD CODE</label>
-                                <input id="code" name="code" type="text" class="form-input" placeholder="..." maxlength="5" autocomplete="one-time-code">
+                                <input id="code" name="code" type="text" class="form-input" placeholder="XXXXX" maxlength="5" autocomplete="one-time-code">
                             </div>
                         </div>
                         <div id="error-msg" class="status-msg"></div>
@@ -78,10 +83,21 @@
                     </form>
                 </div>
             </div>
-            <div id="dashboard-view" class="dashboard-container">
+
+            <div id="dashboard-view" class="dashboard-container" style="display:none">
+                <section class="monitor-host" id="monitor-host" aria-label="Live monitor"></section>
+
+                <div class="run-band">
+                    <div class="start-panel">
+                        <button id="start-career-btn" class="btn btn-primary" type="button" disabled>RUN CAREER</button>
+                        <div id="start-status" class="start-status"></div>
+                    </div>
+                </div>
+
+                <div class="panels-row">
                 <div class="split-left" id="setup-panel">
                     <div class="panel-header">
-                        <span class="panel-header-title">SETUP</span>
+                        <span class="panel-header-title">SETUP &amp; RUN</span>
                     </div>
                     <div class="panel-body">
                         <div class="team-slots">
@@ -131,7 +147,7 @@
                                         <input id="preset-skill-threshold" class="form-input master-data-input preset-input" type="number">
                                     </div>
                                 </div>
-                                <button id="preset-edit-skills-btn" class="btn btn-sm preset-wide-btn" type="button">CONFIGURE SKILLS (PRIORITIES & BLACKLIST)</button>
+                                <button id="preset-edit-skills-btn" class="btn btn-sm preset-wide-btn" type="button">CONFIGURE SKILLS (PRIORITIES &amp; BLACKLIST)</button>
                             </div>
                         </section>
 
@@ -165,19 +181,22 @@
                                 <div class="race-options-content" id="race-options-content"></div>
                             </div>
                         </section>
-
-                        <div class="start-panel">
-                            <button id="start-career-btn" class="btn btn-primary" type="button" disabled>RUN CAREER</button>
-                            <div id="start-status" class="start-status"></div>
-                        </div>
                     </div>
                 </div>
+
                 <div class="split-right" id="content-panel">
                     <div class="panel-header">
                         <span class="panel-header-title">LIBRARY</span>
                     </div>
                     <div class="panel-body">
-                        <section class="dashboard-section">
+                        <div class="lib-tabs" id="lib-tabs" role="tablist" aria-label="Library sections">
+                            <button class="lib-tab" data-lib-target="decks" role="tab" type="button">Decks</button>
+                            <button class="lib-tab" data-lib-target="friends" role="tab" type="button">Friends</button>
+                            <button class="lib-tab" data-lib-target="trainees" role="tab" type="button">Trainees</button>
+                            <button class="lib-tab" data-lib-target="parents" role="tab" type="button">Parents</button>
+                            <button class="lib-tab" data-lib-target="cards" role="tab" type="button">Cards</button>
+                        </div>
+                        <section class="dashboard-section lib-section" data-lib="decks">
                             <h2 class="dashboard-section-title section-title-toggle" id="decks-toggle">
                                 <span class="collapse-chevron expanded" id="decks-chevron">&#9658;</span>
                                 DECKS
@@ -186,7 +205,7 @@
                                 <div id="deck-list"></div>
                             </div>
                         </section>
-                        <section class="dashboard-section">
+                        <section class="dashboard-section lib-section" data-lib="friends">
                             <h2 class="dashboard-section-title section-title-toggle" id="friends-toggle">
                                 <span class="collapse-chevron expanded" id="friends-chevron">&#9658;</span>
                                 FRIEND SUPPORTS <span id="friend-count"></span>
@@ -199,7 +218,7 @@
                                 <div id="friend-grid" class="data-grid"></div>
                             </div>
                         </section>
-                        <section class="dashboard-section">
+                        <section class="dashboard-section lib-section" data-lib="trainees">
                             <h2 class="dashboard-section-title section-title-toggle" id="trainees-toggle">
                                 <span class="collapse-chevron expanded" id="trainees-chevron">&#9658;</span>
                                 TRAINEES <span id="uma-count"></span>
@@ -208,7 +227,7 @@
                                 <div id="uma-grid" class="data-grid"></div>
                             </div>
                         </section>
-                        <section class="dashboard-section">
+                        <section class="dashboard-section lib-section" data-lib="parents">
                             <h2 class="dashboard-section-title section-title-toggle" id="parents-toggle">
                                 <span class="collapse-chevron expanded" id="parents-chevron">&#9658;</span>
                                 PARENTS <span id="parent-count"></span>
@@ -217,7 +236,7 @@
                                 <div id="parent-grid" class="data-grid"></div>
                             </div>
                         </section>
-                        <section class="dashboard-section">
+                        <section class="dashboard-section lib-section" data-lib="cards">
                             <h2 class="dashboard-section-title section-title-toggle" id="cards-toggle">
                                 <span class="collapse-chevron" id="cards-chevron">&#9658;</span>
                                 OWNED CARDS <span id="card-count"></span>
@@ -228,12 +247,15 @@
                         </section>
                     </div>
                 </div>
+                </div>
+
                 <div class="split-gutter-controls" aria-label="Panel controls">
                     <button class="panel-collapse-btn panel-collapse-btn-left" id="setup-collapse-btn" type="button" data-panel-label="Setup" title="Collapse setup" aria-label="Collapse setup"></button>
                     <button class="panel-collapse-btn panel-collapse-btn-right" id="content-collapse-btn" type="button" data-panel-label="Library" title="Collapse library" aria-label="Collapse library"></button>
                 </div>
             </div>
         </main>
+
         <div id="career-modal" class="modal-backdrop">
             <div class="modal-panel">
                 <div class="modal-title">Delete Career?</div>
@@ -254,7 +276,7 @@
             <div class="skill-editor-body">
                 <div class="skill-editor-panel skill-editor-panel-left">
                     <div class="skill-editor-panel-head">
-                        <div class="skill-editor-section-title">TIERS & BLACKLIST</div>
+                        <div class="skill-editor-section-title">TIERS &amp; BLACKLIST</div>
                         <button id="skill-add-tier-btn" class="btn btn-sm skill-editor-action">+ TIER</button>
                     </div>
 
@@ -285,7 +307,9 @@
             </div>
         </div>
     </div>
-    <script src="app.js?v=11"></script>
+    <script src="app.js?v=14"></script>
+    <script src="/js/monitor.js?v=3" defer></script>
+    <script src="/js/nav.js?v=1" defer></script>
+    <script src="/js/parent-filter.js?v=1" defer></script>
 </body>
 </html>
-

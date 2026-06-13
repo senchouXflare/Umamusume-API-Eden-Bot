@@ -517,15 +517,17 @@ const els = {
             els.errorMsg.style.display = 'block';
             resetLoginState();
         }
-        function showTwoFactorPrompt() {
+        function showTwoFactorPrompt(message) {
             setLoadingScreen(false);
             state.needs2fa = true;
             state.isLoading = false;
             els.standardFields.style.display = 'none';
             els.faFields.style.display = 'block';
             els.loginBtn.innerText = 'VALIDATE';
-            els.errorMsg.innerText = '2FA REQUIRED';
+            els.errorMsg.innerText = message || '2FA REQUIRED';
             els.errorMsg.style.display = 'block';
+            const codeInput = document.getElementById('code');
+            if (codeInput) { codeInput.value = ''; codeInput.focus(); }
         }
         function readLoginPayload() {
             return {
@@ -553,14 +555,28 @@ const els = {
             els.loginBtn.innerText = 'WORKING...';
             els.errorMsg.style.display = 'none';
             const payload = readLoginPayload();
+            const loginAbort = new AbortController();
+            const loginTimeout = setTimeout(() => loginAbort.abort(), 120000); // 2 min max
+            // Show hint after 5s that Steam auth is running
+            const steamHint = setTimeout(() => {
+                if (state.isLoading) {
+                    setLoadingScreen(false);
+                    els.errorMsg.innerText = 'CONNECTING TO STEAM... (may take up to 60s)';
+                    els.errorMsg.style.display = 'block';
+                    els.loginBtn.innerText = 'WAITING...';
+                }
+            }, 5000);
             try {
                 const data = await apiJson('/api/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
+                    signal: loginAbort.signal,
                 });
+                clearTimeout(steamHint);
+                clearTimeout(loginTimeout);
                 if (data.needs_2fa) {
-                    showTwoFactorPrompt();
+                    showTwoFactorPrompt(data.detail);
                 } else if (data.success) {
                     localStorage.setItem('saved_username', payload.username);
                     localStorage.setItem('saved_password', payload.password);
@@ -570,7 +586,13 @@ const els = {
                     showLoginError(data.detail || 'FAIL');
                 }
             } catch (e) {
-                showLoginError('NETWORK ERROR');
+                clearTimeout(steamHint);
+                clearTimeout(loginTimeout);
+                if (e.name === 'AbortError') {
+                    showLoginError('LOGIN TIMED OUT — CHECK SERVER');
+                } else {
+                    showLoginError('NETWORK ERROR: ' + (e.message || 'unknown'));
+                }
             }
         });
 
@@ -687,6 +709,10 @@ const els = {
                 <div class="account-pill pill-tp">
                     <span class="label">TP</span>
                     <strong>${tp.current || 0}/${tp.max || 0}</strong>
+                </div>
+                <div class="account-pill pill-potion" title="TP potions (item 32) — used before carats when recovering TP">
+                    <span class="label">TP POTIONS</span>
+                    <strong>${formatNumber(account.potions || 0)}</strong>
                 </div>
                 <div class="account-pill pill-carrots">
                     <span class="label">CARROTS</span>
@@ -1954,6 +1980,12 @@ const els = {
                 if (!data.success || !data.runner) return;
                 const runner = data.runner;
                 applyRunnerSnapshot(runner);
+                if (data.account) {
+                    // server overlay is live truth; sync clock bookkeeping so
+                    // applyRunnerClockUsage doesn't double-subtract later
+                    state.displayedClocksUsed = Number(runner.clocks_used || 0);
+                    renderAccountStrip(data.account);
+                }
 
                 const rows = (runner.action_history && runner.action_history.length) ? runner.action_history : deriveActionHistory(runner.log || []);
                 if (rows.length) renderActionHistory(rows);
@@ -2147,14 +2179,16 @@ const els = {
             renderTeamPanel();
             syncSelectionToServer();
         }
-        function selectParent(index, element) {
+        function selectParent(instanceId, element) {
             if (element.classList.contains('vet-full')) return;
+            const dataIdx = dashData.parents ? dashData.parents.findIndex(p => Number(p.instance_id) === Number(instanceId)) : -1;
+            if (dataIdx < 0) return;
             if (element.classList.contains('selected')) {
                 element.classList.remove('selected');
-                selection.veterans = selection.veterans.filter(parent => parent._gridIdx !== index);
+                selection.veterans = selection.veterans.filter(parent => Number(parent.instance_id) !== Number(instanceId));
             } else if (selection.veterans.length < 2) {
                 element.classList.add('selected');
-                selection.veterans.push({ ...dashData.parents[index], _gridIdx: index });
+                selection.veterans.push({ ...dashData.parents[dataIdx], _gridIdx: dataIdx });
             }
             updateVetSelectability();
             renderTeamPanel();
@@ -2168,9 +2202,10 @@ const els = {
                 element.classList.add('selectable');
                 element.addEventListener('click', () => selectTrainee(index, element));
             });
-            document.querySelectorAll('#parent-grid .grid-card').forEach((element, index) => {
+            document.querySelectorAll('#parent-grid .grid-card').forEach((element) => {
                 element.classList.add('selectable');
-                element.addEventListener('click', () => selectParent(index, element));
+                const iid = element.dataset.instanceId;
+                element.addEventListener('click', () => selectParent(iid, element));
             });
         }
         function isValidDeck(deck) {
@@ -2243,11 +2278,26 @@ const els = {
                 </div>`;
             }).join('');
         }
+        // Format create_date (Unix seconds) as a human-readable age string
+        function parentAgeLabel(createDate) {
+            if (!createDate) return null;
+            const nowS = Date.now() / 1000;
+            const diffS = nowS - createDate;
+            if (diffS < 0) return null;
+            if (diffS < 3600) return Math.floor(diffS / 60) + 'm ago';
+            if (diffS < 86400) return Math.floor(diffS / 3600) + 'h ago';
+            return Math.floor(diffS / 86400) + 'd ago';
+        }
+
         function renderParents(parents) {
+            const nowS = Date.now() / 1000;
             els.parentGrid.innerHTML = parents.map(parent => {
                 const imgId = parent.card_id || '100101';
-                return `<div class="grid-card">
+                const ageLabel = parentAgeLabel(parent.create_date);
+                const isNew = parent.create_date && (nowS - parent.create_date) < 86400;
+                return `<div class="grid-card" data-instance-id="${parent.instance_id || ''}" data-create-date="${parent.create_date || 0}">
                     <div class="rank-badge">${rankMap[parent.rank] || '??'}</div>
+                    ${ageLabel ? `<span class="parent-age-badge${isNew ? ' parent-age-new' : ''}">${ageLabel}</span>` : ''}
                     <img src="/api/images/${imgId}.png" onerror="hideBrokenImage(this)">
                     <div class="sparks-tooltip" style="--spark-bg: url('/api/images/${imgId}.png')">
                         <div class="sparks-tooltip-title"></div>
@@ -2261,8 +2311,66 @@ const els = {
                         <span class="grid-card-kicker">ID: ${parent.instance_id || '?'}</span>
                         <span class="grid-card-name">${parent.name || 'Unknown'}</span>
                     </div>
+                    <button class="parent-delete-btn" title="Delete parent" data-id="${parent.instance_id || ''}">&#128465;</button>
                 </div>`;
             }).join('');
+
+            // Attach single-card delete handlers
+            els.parentGrid.querySelectorAll('.parent-delete-btn').forEach(btn => {
+                btn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const id = parseInt(btn.dataset.id, 10);
+                    const card = btn.closest('.grid-card');
+                    const name = card.querySelector('.grid-card-name')?.textContent || String(id);
+                    if (!confirm(`Delete parent "${name}" (ID: ${id})?\nThis cannot be undone.`)) return;
+                    await _doRemoveParents([id], [card], btn);
+                });
+            });
+        }
+
+        // Shared remove logic: POST ids, fade+remove cards, update dashData/selection
+        async function _doRemoveParents(ids, cards, triggerEl) {
+            if (triggerEl) { triggerEl.disabled = true; triggerEl.textContent = '…'; }
+            try {
+                const res = await fetch('/api/parents/remove', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({trained_chara_ids: ids})
+                });
+                const data = await res.json();
+                if (data.success) {
+                    const idSet = new Set(ids);
+                    if (dashData.parents) dashData.parents = dashData.parents.filter(p => !idSet.has(Number(p.instance_id)));
+                    selection.veterans = selection.veterans.filter(v => !idSet.has(Number(v.instance_id)));
+                    renderTeamPanel();
+                    (cards || []).forEach(card => {
+                        card.style.transition = 'opacity 0.25s';
+                        card.style.opacity = '0';
+                        setTimeout(() => card.remove(), 260);
+                    });
+                } else {
+                    alert('Delete failed: ' + (data.detail || 'unknown error'));
+                    if (triggerEl) { triggerEl.disabled = false; triggerEl.innerHTML = '&#128465;'; }
+                }
+            } catch (err) {
+                alert('Delete failed: ' + err.message);
+                if (triggerEl) { triggerEl.disabled = false; triggerEl.innerHTML = '&#128465;'; }
+            }
+        }
+
+        // Auto-delete parents created within maxHours — called from the filter bar button
+        async function autoDeleteRecentParents(maxHours) {
+            const nowS = Date.now() / 1000;
+            const cutoff = nowS - maxHours * 3600;
+            const cards = [...els.parentGrid.querySelectorAll('.grid-card[data-create-date]')]
+                .filter(c => {
+                    const cd = parseFloat(c.dataset.createDate);
+                    return cd > 0 && cd >= cutoff;
+                });
+            if (!cards.length) { alert('No parents found within the last ' + maxHours + 'h.'); return; }
+            const ids = cards.map(c => parseInt(c.dataset.instanceId, 10)).filter(Boolean);
+            if (!confirm(`Auto-delete ${ids.length} parent(s) created in the last ${maxHours}h?\nThis cannot be undone.`)) return;
+            await _doRemoveParents(ids, cards, null);
         }
         function renderTrainees(umas) {
             els.umaGrid.innerHTML = umas.map(uma => {
@@ -2351,6 +2459,7 @@ const els = {
             }
             if (serverSelection.trainee && dashData.umas) {
                 const umaIdx = dashData.umas.findIndex(u => String(u.id) === String(serverSelection.trainee.id));
+
                 if (umaIdx >= 0) {
                     selection.trainee = dashData.umas[umaIdx];
                     const umaEls = document.querySelectorAll('#uma-grid .grid-card');
@@ -2379,30 +2488,33 @@ const els = {
         }
 
         async function renderDashboard(data, options = {}) {
-            dashData = data;
-            dashData.validDecks = data.decks.filter(isValidDeck);
-            dashData.friends = data.friends || [];
-            dashData.friendExcludeIds = data.friendExcludeIds || [];
             showDashboardView(data);
+            state.account = data.account || null;
+            dashData = data;
+            dashData.validDecks = data.decks ? data.decks.filter(isValidDeck) : [];
+            dashData.friends = data.friends || [];
             renderCounts(data);
             renderDecks(dashData.validDecks);
-            renderParents(data.parents);
-            renderTrainees(dashData.umas);
-            renderSupports(data.supports);
-            resetSelection();
-            if (data.selection) applyServerSelection(data.selection);
-            autoLoadCareerSelection();
-
+            renderTrainees(data.umas || []);
+            renderParents(data.parents || []);
+            renderSupports(data.supports || []);
             await loadPresets();
             if (!dashData.friends.length) {
                 loadFriends(false);
             } else {
                 renderFriends();
             }
+            renderRaces();
             bindSparkTooltips();
             attachSelectionHandlers();
             bindRaceHandlers();
             bindPresetHandlers();
+            if (data.account && data.account.career && data.account.career.active) {
+                autoLoadCareerSelection();
+            }
+            if (data.selection) {
+                applyServerSelection(data.selection);
+            }
             renderTeamPanel();
 
             startRunnerPolling();
@@ -2415,17 +2527,22 @@ const els = {
             }
         }
 
+        function showLoginView() {
+            els.dashboardView.classList.remove('active');
+            els.loginView.style.display = 'flex';
+            document.body.classList.remove('dashboard-mode');
+            hideNavbar();
+            setLoadingScreen(false);
+        }
+
         async function restoreSession() {
             try {
                 const data = await apiJson('/api/session?t=' + Date.now());
                 if (data && data.success) await renderDashboard(data, { animateIntro: true, waitForIntro: false });
-                else {
-                    hideNavbar();
-                    setLoadingScreen(false);
-                }
+                if (data && data.success) await renderDashboard(data, { animateIntro: true, waitForIntro: false });
+                else showLoginView();
             } catch (e) {
-                hideNavbar();
-                setLoadingScreen(false);
+                showLoginView();
             }
         }
         bindDelayControls();
