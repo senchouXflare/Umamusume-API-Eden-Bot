@@ -1,24 +1,48 @@
 /* Parent Spark Filter — filters the Parents grid by spark data parsed from the
    already-rendered tooltips. Never removes or reorders DOM nodes (app.js selects
-   parents by element index), only toggles display and CSS order. */
+   parents by element index), only toggles display and CSS order.
+
+   Spark colors (Umamusume): Blue = stat, Pink = aptitude, Green = unique skill,
+   White = regular skills / races / scenario. A parent has at most one Blue, one
+   Pink and one Green spark, but can carry several White sparks — so Blue/Pink/
+   Green are single-select dropdowns and White is a multi-select (AND match).
+   The ★ threshold is the lineage total (all 3 generations, max 9★; Green max 3★). */
 (() => {
     'use strict';
 
     const STORE_KEY = 'parentFilter';
     const CATEGORIES = ['stat', 'aptitude', 'unique', 'skill', 'race', 'scenario'];
 
+    // category -> spark-color group
+    const CAT_GROUP = {
+        stat: 'blue',
+        aptitude: 'pink',
+        unique: 'green',
+        skill: 'white',
+        race: 'white',
+        scenario: 'white',
+        other: 'white',
+    };
+
     const state = {
         search: '',
         cats: [],
-        factor: '',
+        blue: '',         // single factor key (stat)
+        pink: '',         // single factor key (aptitude)
+        green: '',        // single factor key (unique)
+        white: [],        // multiple factor keys (skill / race / scenario)
         minStars: 0,
-        scope: 'lineage', // 'lineage' | 'self'
-        sort: 'none',     // 'none' | 'factor' | 'stars' | 'rank'
+        sort: 'none',     // 'none' | 'selected' | 'stars' | 'rank'
         maxAgeH: 0,       // age filter window in hours (0 = off)
     };
-    try { Object.assign(state, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {}
+    try {
+        const saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+        Object.assign(state, saved);
+        if (!Array.isArray(state.white)) state.white = [];
+        delete state.factor; delete state.scope; // migrate legacy single-factor state
+    } catch (e) {}
 
-    let cards = []; // [{el, name, rank, factors: Map(nameLower -> {label, cat, total, self}), totalStars}]
+    let cards = []; // [{el, name, rank, factors: Map(key -> {label, cat, total, self}), totalStars}]
     let bar = null;
 
     const RANK_ORDER = { 'SS+': 13, 'SS': 12, 'S+': 11, 'S': 10, 'A+': 9, 'A': 8, 'B+': 7, 'B': 6, 'C+': 5, 'C': 4, 'D+': 3, 'D': 2, 'E': 1 };
@@ -66,11 +90,18 @@
         rebuildFactorOptions();
     }
 
-    function factorScore(card) {
-        if (!state.factor) return card.totalStars;
-        const row = card.factors.get(state.factor);
-        if (!row) return 0;
-        return state.scope === 'self' ? row.self : row.total;
+    function factorTotal(card, key) {
+        if (!key) return 0;
+        const row = card.factors.get(key);
+        return row ? row.total : 0;
+    }
+
+    function selectedKeys() {
+        return [state.blue, state.pink, state.green, ...state.white].filter(Boolean);
+    }
+
+    function selectedScore(card) {
+        return selectedKeys().reduce((sum, key) => sum + factorTotal(card, key), 0);
     }
 
     function passes(card) {
@@ -91,8 +122,14 @@
             }
             if (!hit) return false;
         }
-        if (state.factor) {
-            if (factorScore(card) < (state.minStars || 1)) return false;
+        const min = state.minStars || 1;
+        // Blue / Pink / Green — single each
+        for (const key of [state.blue, state.pink, state.green]) {
+            if (key && factorTotal(card, key) < min) return false;
+        }
+        // White — must have ALL selected (AND)
+        for (const key of state.white) {
+            if (factorTotal(card, key) < min) return false;
         }
         return true;
     }
@@ -106,7 +143,7 @@
             card.el.style.display = ok ? '' : 'none';
             if (ok) shown++;
             let order = 0;
-            if (state.sort === 'factor') order = -factorScore(card);
+            if (state.sort === 'selected') order = -selectedScore(card);
             else if (state.sort === 'stars') order = -card.totalStars;
             else if (state.sort === 'rank') order = -(RANK_ORDER[card.rank] || 0);
             card.el.style.order = String(order);
@@ -116,24 +153,77 @@
         save();
     }
 
-    function rebuildFactorOptions() {
-        const select = bar && bar.querySelector('#parent-filter-factor');
-        if (!select) return;
-        const names = new Map();
+    // ---- option building -------------------------------------------------
+
+    function groupedFactors() {
+        const groups = { blue: new Map(), pink: new Map(), green: new Map(), white: new Map() };
         cards.forEach(card => card.factors.forEach((row, key) => {
-            if (!names.has(key)) names.set(key, row);
+            const g = CAT_GROUP[row.cat] || 'white';
+            if (!groups[g].has(key)) groups[g].set(key, row);
         }));
-        const sorted = Array.from(names.entries()).sort((a, b) => {
-            if (a[1].cat !== b[1].cat) return a[1].cat.localeCompare(b[1].cat);
-            return a[1].label.localeCompare(b[1].label);
-        });
-        const current = state.factor;
-        select.innerHTML = '<option value="">— factor —</option>' + sorted.map(([key, row]) =>
-            `<option value="${key.replace(/"/g, '&quot;')}">[${row.cat}] ${row.label}</option>`
-        ).join('');
-        if (current && names.has(current)) select.value = current;
-        else if (current) { state.factor = ''; }
+        return groups;
     }
+
+    function sortedEntries(map) {
+        return Array.from(map.entries()).sort((a, b) => a[1].label.localeCompare(b[1].label));
+    }
+
+    function fillSingleSelect(id, placeholder, map, current) {
+        const select = bar && bar.querySelector(id);
+        if (!select) return;
+        const entries = sortedEntries(map);
+        select.innerHTML = `<option value="">${placeholder}</option>` + entries.map(([key, row]) =>
+            `<option value="${key.replace(/"/g, '&quot;')}">${row.label}</option>`
+        ).join('');
+        select.value = (current && map.has(current)) ? current : '';
+    }
+
+    function rebuildFactorOptions() {
+        if (!bar) return;
+        const groups = groupedFactors();
+        fillSingleSelect('#pf-blue', '— Blue spark —', groups.blue, state.blue);
+        fillSingleSelect('#pf-pink', '— Pink spark —', groups.pink, state.pink);
+        fillSingleSelect('#pf-green', '— Green spark —', groups.green, state.green);
+        // keep state in sync if a previously-selected option vanished
+        if (state.blue && !groups.blue.has(state.blue)) state.blue = '';
+        if (state.pink && !groups.pink.has(state.pink)) state.pink = '';
+        if (state.green && !groups.green.has(state.green)) state.green = '';
+
+        const panel = bar.querySelector('#pf-white-panel');
+        if (panel) {
+            const entries = sortedEntries(groups.white);
+            const valid = new Set(entries.map(([k]) => k));
+            state.white = state.white.filter(k => valid.has(k));
+            panel.innerHTML = entries.length
+                ? entries.map(([key, row]) => {
+                    const checked = state.white.includes(key) ? 'checked' : '';
+                    const safe = key.replace(/"/g, '&quot;');
+                    return `<label class="pf-white-item"><input type="checkbox" value="${safe}" ${checked}><span>${row.label}</span></label>`;
+                }).join('')
+                : '<div class="pf-white-empty">No white sparks</div>';
+            panel.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                cb.addEventListener('change', () => {
+                    const v = cb.value;
+                    const idx = state.white.indexOf(v);
+                    if (cb.checked && idx < 0) state.white.push(v);
+                    else if (!cb.checked && idx >= 0) state.white.splice(idx, 1);
+                    updateWhiteToggle();
+                    apply();
+                });
+            });
+        }
+        updateWhiteToggle();
+    }
+
+    function updateWhiteToggle() {
+        const toggle = bar && bar.querySelector('#pf-white-toggle');
+        if (!toggle) return;
+        const n = state.white.length;
+        toggle.textContent = n ? `White spark (${n}) ▾` : 'White spark ▾';
+        toggle.classList.toggle('has-selection', n > 0);
+    }
+
+    // ---- bar -------------------------------------------------------------
 
     function buildBar() {
         bar = document.createElement('div');
@@ -146,18 +236,20 @@
                     `<button type="button" class="pf-chip" data-cat="${c}">${c.toUpperCase()}</button>`).join('')}
                 </div>
             </div>
-            <div class="pf-row">
-                <select id="parent-filter-factor" class="form-input pf-select"></select>
+            <div class="pf-row pf-row-sparks">
+                <select id="pf-blue" class="form-input pf-select pf-spark pf-spark-blue"></select>
+                <select id="pf-pink" class="form-input pf-select pf-spark pf-spark-pink"></select>
+                <select id="pf-green" class="form-input pf-select pf-spark pf-spark-green"></select>
+                <div class="pf-white" id="pf-white">
+                    <button type="button" id="pf-white-toggle" class="form-input pf-select pf-spark pf-spark-white pf-white-toggle">White spark ▾</button>
+                    <div class="pf-white-panel" id="pf-white-panel" hidden></div>
+                </div>
                 <select id="parent-filter-stars" class="form-input pf-select pf-select-sm">
                     ${[1,2,3,4,5,6,7,8,9].map(n => `<option value="${n}">≥ ${n}★</option>`).join('')}
                 </select>
-                <select id="parent-filter-scope" class="form-input pf-select pf-select-sm">
-                    <option value="lineage">Cả 3 đời</option>
-                    <option value="self">Chỉ bản thân</option>
-                </select>
                 <select id="parent-filter-sort" class="form-input pf-select pf-select-sm">
                     <option value="none">Sort: mặc định</option>
-                    <option value="factor">Sort: ★ factor</option>
+                    <option value="selected">Sort: ★ spark đã chọn</option>
                     <option value="stars">Sort: tổng ★</option>
                     <option value="rank">Sort: rank</option>
                 </select>
@@ -197,40 +289,32 @@
             });
         });
 
-        const factorSel = bar.querySelector('#parent-filter-factor');
-        factorSel.addEventListener('change', () => { state.factor = factorSel.value; apply(); });
+        const blueSel = bar.querySelector('#pf-blue');
+        blueSel.addEventListener('change', () => { state.blue = blueSel.value; apply(); });
+        const pinkSel = bar.querySelector('#pf-pink');
+        pinkSel.addEventListener('change', () => { state.pink = pinkSel.value; apply(); });
+        const greenSel = bar.querySelector('#pf-green');
+        greenSel.addEventListener('change', () => { state.green = greenSel.value; apply(); });
+
+        // White multi-select open/close
+        const whiteWrap = bar.querySelector('#pf-white');
+        const whiteToggle = bar.querySelector('#pf-white-toggle');
+        const whitePanel = bar.querySelector('#pf-white-panel');
+        whiteToggle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            whitePanel.hidden = !whitePanel.hidden;
+        });
+        document.addEventListener('click', (e) => {
+            if (!whiteWrap.contains(e.target)) whitePanel.hidden = true;
+        });
 
         const starsSel = bar.querySelector('#parent-filter-stars');
         starsSel.value = String(state.minStars || 1);
         starsSel.addEventListener('change', () => { state.minStars = parseInt(starsSel.value, 10) || 1; apply(); });
 
-        const scopeSel = bar.querySelector('#parent-filter-scope');
-        scopeSel.value = state.scope;
-        scopeSel.addEventListener('change', () => { state.scope = scopeSel.value; apply(); });
-
         const sortSel = bar.querySelector('#parent-filter-sort');
         sortSel.value = state.sort;
         sortSel.addEventListener('change', () => { state.sort = sortSel.value; apply(); });
-
-        bar.querySelector('#parent-filter-clear').addEventListener('click', () => {
-            state.search = '';
-            state.cats = [];
-            state.factor = '';
-            state.minStars = 0;
-            state.sort = 'none';
-
-            state.scope = 'lineage';
-            search.value = '';
-            factorSel.value = '';
-            starsSel.value = '1';
-            scopeSel.value = 'lineage';
-            sortSel.value = 'none';
-            bar.querySelectorAll('.pf-chip').forEach(c => c.classList.remove('active'));
-            ageSel.value = '0';
-            state.maxAgeH = 0;
-            updateAutodelHint();
-            apply();
-        });
 
         // Age filter
         const ageSel = bar.querySelector('#parent-filter-age');
@@ -263,13 +347,6 @@
             }
         }
 
-        ageSel.addEventListener('change', () => {
-            state.maxAgeH = parseInt(ageSel.value, 10) || 0;
-            applyAgeFilter();
-            updateAutodelHint();
-            save();
-        });
-
         function applyAgeFilter() {
             const maxH = state.maxAgeH || 0;
             const grid = document.getElementById('parent-grid');
@@ -290,17 +367,50 @@
             apply();
         }
 
+        ageSel.addEventListener('change', () => {
+            state.maxAgeH = parseInt(ageSel.value, 10) || 0;
+            applyAgeFilter();
+            updateAutodelHint();
+            save();
+        });
+
+        bar.querySelector('#parent-filter-clear').addEventListener('click', () => {
+            state.search = '';
+            state.cats = [];
+            state.blue = '';
+            state.pink = '';
+            state.green = '';
+            state.white = [];
+            state.minStars = 0;
+            state.sort = 'none';
+            search.value = '';
+            blueSel.value = '';
+            pinkSel.value = '';
+            greenSel.value = '';
+            starsSel.value = '1';
+            sortSel.value = 'none';
+            bar.querySelectorAll('.pf-chip').forEach(c => c.classList.remove('active'));
+            whitePanel.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.checked = false; });
+            updateWhiteToggle();
+            ageSel.value = '0';
+            state.maxAgeH = 0;
+            applyAgeFilter();
+            updateAutodelHint();
+            apply();
+        });
+
         bar.querySelector('#parent-autodel-btn').addEventListener('click', async () => {
             const maxH = parseInt(ageSel.value, 10) || 0;
             if (!maxH) { alert('Select an age window first.'); return; }
-            if (typeof autoDeleteRecentParents === 'function') {
-                await autoDeleteRecentParents(maxH);
+            if (typeof window.autoDeleteRecentParents === 'function') {
+                await window.autoDeleteRecentParents(maxH);
                 updateAutodelHint();
+            } else {
+                alert('Auto-delete is unavailable (app.js not loaded).');
             }
         });
 
         updateAutodelHint();
-
         return bar;
     }
 

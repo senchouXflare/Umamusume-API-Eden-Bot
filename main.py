@@ -298,6 +298,7 @@ active_client = None
 active_account = None
 active_dashboard_data = None
 active_start_state = {}
+_LAST_PARENT_TIME_DEBUG = None
 active_parent_cards = {}
 active_parent_rank_points = {}
 pending_game_auth_config = {}
@@ -821,6 +822,64 @@ def get_win_summary(win_saddle_ids):
 
     summary["total"] = summary["g1"] + summary["g2"] + summary["g3"]
     return summary
+
+
+def parse_chara_epoch(chara):
+    """Return the parent's creation time as Unix epoch seconds (UTC), or 0.
+
+    The trained_chara payload exposes the timestamp as `create_time` /
+    `register_time`, a UTC datetime string like "2026-06-11 16:37:59" (NOT a
+    numeric epoch). Older code looked for `create_date`/`created_at`, which do
+    not exist, so every parent ended up with 0 and the age filter / auto-delete
+    matched nobody. We accept either the string form or a raw numeric epoch.
+    """
+    def _to_epoch(raw):
+        import datetime as _dt
+        if not raw:
+            return 0
+        if isinstance(raw, bool):
+            return 0
+        # Already a numeric epoch (int/float or numeric string).
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        s = str(raw).strip()
+        if not s:
+            return 0
+        if s.isdigit():
+            return int(s)
+        # Parse "YYYY-MM-DD HH:MM:SS" (UTC) -> epoch seconds.
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S.%f"):
+            try:
+                dt = _dt.datetime.strptime(s, fmt).replace(tzinfo=_dt.timezone.utc)
+                return int(dt.timestamp())
+            except ValueError:
+                continue
+        return 0
+
+    # Preferred, known field names first.
+    for key in ("create_time", "register_time", "create_date", "created_at"):
+        epoch = _to_epoch(chara.get(key))
+        if epoch:
+            return epoch
+
+    # Fallback: some endpoints (e.g. load/index) may name the field differently.
+    # Scan any key that looks like a creation/registration timestamp and accept
+    # the earliest plausible value (after 2020-01-01, not in the far future).
+    import time as _time
+    PLAUSIBLE_MIN = 1577836800          # 2020-01-01 UTC
+    plausible_max = int(_time.time()) + 86400
+    best = 0
+    for k, v in chara.items():
+        kl = str(k).lower()
+        if not any(t in kl for t in ("create", "regist")):
+            continue
+        if not any(t in kl for t in ("time", "date")):
+            continue
+        epoch = _to_epoch(v)
+        if PLAUSIBLE_MIN <= epoch <= plausible_max:
+            best = epoch if best == 0 else min(best, epoch)
+    return best
 
 
 def clean_factor_name(name, base_id=None, category=None):
@@ -1594,6 +1653,20 @@ async def login(req: LoginRequest):
 
         parents = []
         trained_chara_list = d.get("trained_chara", [])
+        # Diagnostic: capture the raw timestamp fields of the first parent so we
+        # can verify create_time is present in the live login (load/index) data.
+        global _LAST_PARENT_TIME_DEBUG
+        if trained_chara_list:
+            _c0 = trained_chara_list[0]
+            _date_keys = {
+                k: _c0.get(k) for k in _c0.keys()
+                if any(t in str(k).lower() for t in ("time", "date", "create", "regist"))
+            }
+            _LAST_PARENT_TIME_DEBUG = {
+                "all_keys": sorted(_c0.keys()),
+                "date_like_fields": _date_keys,
+                "computed_create_date": parse_chara_epoch(_c0),
+            }
         for chara in trained_chara_list:
 
             raw_id = str(chara.get("card_id", ""))
@@ -1693,7 +1766,7 @@ async def login(req: LoginRequest):
                     "card_id": cid,
                     "name": chara_map.get(cid, f"Unknown ({cid})"),
                     "rank": chara.get("rank", 0),
-                    "create_date": chara.get("create_date") or chara.get("created_at") or 0,
+                    "create_date": parse_chara_epoch(chara),
                     "tree": tree,
                 }
             )
@@ -2286,6 +2359,33 @@ async def remove_recent_parents(req: RemoveRecentParentsRequest):
         return {"success": True, "removed": len(candidates), "ids": candidates, "result": result}
     except Exception as e:
         return {"success": False, "detail": str(e)}
+
+
+@app.get("/api/debug/parent_times")
+async def debug_parent_times():
+    """Diagnose the parent age filter: shows the raw timestamp fields from the
+    live login data and how many parents got a usable create_date. Open
+    http://127.0.0.1:<port>/api/debug/parent_times in a browser after logging in.
+    """
+    import datetime as _dt
+    parents = (active_dashboard_data or {}).get("parents") or []
+    nonzero = [p for p in parents if int(p.get("create_date") or 0) > 0]
+    sample = []
+    for p in parents[:8]:
+        cd = int(p.get("create_date") or 0)
+        sample.append({
+            "instance_id": p.get("instance_id"),
+            "name": p.get("name"),
+            "create_date": cd,
+            "created_utc": (_dt.datetime.utcfromtimestamp(cd).isoformat() if cd else None),
+        })
+    return {
+        "logged_in": active_dashboard_data is not None,
+        "parent_count": len(parents),
+        "parents_with_create_date": len(nonzero),
+        "first_parent_raw": _LAST_PARENT_TIME_DEBUG,
+        "sample": sample,
+    }
 
 
 @app.get("/api/debug/last_ticket")

@@ -691,6 +691,59 @@ body.shell-v2 .run-band .start-status {
   white-space: nowrap;
 }
 
+/* ---------- Spark color dropdowns (Blue / Pink / Green / White) ---------- */
+.pf-row-sparks { align-items: center; }
+.pf-spark {
+  flex: 1 1 9rem;
+  min-width: 8rem;
+  border-left-width: 3px;
+  border-left-style: solid;
+}
+.pf-spark-blue  { border-left-color: #00b3ff; }
+.pf-spark-pink  { border-left-color: #ff4d8d; }
+.pf-spark-green { border-left-color: #38d96b; }
+.pf-spark-white { border-left-color: #e9eef5; }
+
+.pf-white { position: relative; flex: 1 1 9rem; min-width: 8rem; display: flex; }
+.pf-white-toggle {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.pf-white-toggle.has-selection { color: var(--accent-primary); }
+.pf-white-panel {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  z-index: 200;
+  width: max(100%, 14rem);
+  max-height: 16rem;
+  overflow-y: auto;
+  padding: 0.35rem;
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  box-shadow: 0 0.8rem 1.8rem rgba(0, 0, 0, 0.55);
+}
+.pf-white-panel[hidden] { display: none; }
+.pf-white-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.3rem 0.4rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text-main);
+  font: 500 0.74rem/1.2 var(--font-family);
+}
+.pf-white-item:hover { background: rgba(var(--accent-primary-rgb), 0.12); }
+.pf-white-item input { accent-color: var(--accent-primary); cursor: pointer; }
+.pf-white-empty {
+  padding: 0.5rem 0.4rem;
+  color: var(--text-muted);
+  font: 500 0.74rem/1.2 var(--font-family);
+}
+
 /* ---------- Parent age badge ---------- */
 .parent-age-badge {
   position: absolute;
@@ -708,6 +761,18 @@ body.shell-v2 .run-band .start-status {
 .parent-age-badge.parent-age-new {
   background: rgba(var(--accent-primary-rgb), 0.22);
   color: var(--accent-primary);
+}
+
+/* Creation date/time line inside the parent card overlay */
+.grid-card-date {
+  display: block;
+  margin-top: 0.1rem;
+  color: var(--text-muted);
+  font: 600 0.56rem/1.2 var(--font-family);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Auto-delete row in filter bar */
@@ -730,9 +795,9 @@ body.shell-v2 .run-band .start-status {
 .grid-card { position: relative; }
 .parent-delete-btn {
   position: absolute;
-  top: 0.35rem;
+  bottom: 0.35rem;
   right: 0.35rem;
-  z-index: 10;
+  z-index: 11;
   display: none;
   width: 1.6rem;
   height: 1.6rem;

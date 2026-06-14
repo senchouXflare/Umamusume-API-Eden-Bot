@@ -2289,11 +2289,21 @@ const els = {
             return Math.floor(diffS / 86400) + 'd ago';
         }
 
+        // Format create_date (Unix seconds) as an absolute local date+time line
+        function parentCreatedLabel(createDate) {
+            if (!createDate) return null;
+            const d = new Date(createDate * 1000);
+            if (isNaN(d.getTime())) return null;
+            const pad = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+
         function renderParents(parents) {
             const nowS = Date.now() / 1000;
             els.parentGrid.innerHTML = parents.map(parent => {
                 const imgId = parent.card_id || '100101';
                 const ageLabel = parentAgeLabel(parent.create_date);
+                const createdLabel = parentCreatedLabel(parent.create_date);
                 const isNew = parent.create_date && (nowS - parent.create_date) < 86400;
                 return `<div class="grid-card" data-instance-id="${parent.instance_id || ''}" data-create-date="${parent.create_date || 0}">
                     <div class="rank-badge">${rankMap[parent.rank] || '??'}</div>
@@ -2310,6 +2320,7 @@ const els = {
                     <div class="grid-card-overlay">
                         <span class="grid-card-kicker">ID: ${parent.instance_id || '?'}</span>
                         <span class="grid-card-name">${parent.name || 'Unknown'}</span>
+                        ${createdLabel ? `<span class="grid-card-date" title="Created (local time)">🕒 ${createdLabel}</span>` : ''}
                     </div>
                     <button class="parent-delete-btn" title="Delete parent" data-id="${parent.instance_id || ''}">&#128465;</button>
                 </div>`;
@@ -2372,6 +2383,8 @@ const els = {
             if (!confirm(`Auto-delete ${ids.length} parent(s) created in the last ${maxHours}h?\nThis cannot be undone.`)) return;
             await _doRemoveParents(ids, cards, null);
         }
+        // Expose for parent-filter.js (which runs in its own scope)
+        window.autoDeleteRecentParents = autoDeleteRecentParents;
         function renderTrainees(umas) {
             els.umaGrid.innerHTML = umas.map(uma => {
                 const imgId = uma.id || '100101';

@@ -1916,8 +1916,16 @@ body.dashboard-mode .turn-delay-control {
   text-align: center;
 }
 .grid-card.vet-full {
-  opacity: 0.45;
-  pointer-events: none;
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+/* Keep dimmed parents fully usable: hover sparks, inspect, and delete still
+   work — only picking a 3rd parent is blocked (handled in selectParent). */
+.grid-card.vet-full:hover {
+  opacity: 0.85;
+}
+.grid-card.vet-full .parent-delete-btn {
+  cursor: pointer;
 }
 .deck-container {
   cursor: pointer;
