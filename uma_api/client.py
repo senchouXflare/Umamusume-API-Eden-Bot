@@ -554,7 +554,7 @@ class UmaClient:
             'Content-Type': 'application/x-msgpack', 'X-Unity-Version': self.unity_ver
         })
 
-    def call(self, ep, args=None, retry_208=6, retry_205=3):
+    def call(self, ep, args=None, retry_208=6, retry_205=5):
         if not hasattr(self, '_last_raw_call_ts'):
             self._last_raw_call_ts = 0
 
@@ -619,6 +619,7 @@ class UmaClient:
         net_attempt = 0
         http5xx_attempt = 0
         attempt_208 = 0
+        attempt_205 = 0
 
         while True:
             # --- transport layer (network errors + HTTP status) ---
@@ -681,8 +682,15 @@ class UmaClient:
             if rc != 1:
                 if rc == 205 and retries_205_left > 0:
                     retries_205_left -= 1
-                    print(f"205 on {ep}, retrying... ({retries_205_left} left)")
-                    dna_sleep(0.14, 0.19, 0.166, 0.0083)
+                    # First retry stays fast (205 is often a transient desync that
+                    # clears immediately), then back off exponentially so a real
+                    # server hiccup (e.g. preceding 504) doesn't burn the whole
+                    # budget in <0.5s and escalate to a fatal exception.
+                    wait_min = min(0.16 * (3 ** attempt_205), 8.0)
+                    wait_max = min(wait_min * 1.6, 12.0)
+                    attempt_205 += 1
+                    print(f"205 on {ep}, retrying in ~{wait_min:.2f}s... ({retries_205_left} left)")
+                    dna_sleep(wait_min, wait_max)
                     continue
 
                 if rc == 394 and retries_394_left > 0:

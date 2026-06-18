@@ -1412,24 +1412,40 @@ def start_career_from_request(req):
     except Exception:
         pass
 
-    result = active_client.start_career(
-        card_id=req.card_id,
-        support_card_ids=req.support_card_ids,
-        friend_viewer_id=req.friend_viewer_id,
-        friend_card_id=req.friend_card_id,
-        parent_id_1=req.parent_id_1,
-        parent_id_2=req.parent_id_2,
-        scenario_id=req.scenario_id,
-        deck_id=req.deck_id,
-        use_tp=req.use_tp,
-        tp_info=tp_info,
-        current_money=current_money,
-        succession_rank_point=succession_rank_point,
-        difficulty_id=req.difficulty_id,
-        difficulty=req.difficulty,
-        is_boost=req.is_boost,
-        boost_story_event_id=req.boost_story_event_id,
-    )
+    try:
+        result = active_client.start_career(
+            card_id=req.card_id,
+            support_card_ids=req.support_card_ids,
+            friend_viewer_id=req.friend_viewer_id,
+            friend_card_id=req.friend_card_id,
+            parent_id_1=req.parent_id_1,
+            parent_id_2=req.parent_id_2,
+            scenario_id=req.scenario_id,
+            deck_id=req.deck_id,
+            use_tp=req.use_tp,
+            tp_info=tp_info,
+            current_money=current_money,
+            succession_rank_point=succession_rank_point,
+            difficulty_id=req.difficulty_id,
+            difficulty=req.difficulty,
+            is_boost=req.is_boost,
+            boost_story_event_id=req.boost_story_event_id,
+        )
+    except Exception as e:
+        # 102 on start = a career is already in progress on the server (e.g. the
+        # previous run crashed mid-career). You can never start a new one until
+        # the old one is finished, so retrying start_career just loops on 102
+        # forever. Resume the existing career instead.
+        if "102" not in str(e):
+            raise
+        print("start_career got 102 (career already in progress) -> resuming existing career", flush=True)
+        try:
+            result = active_client.call("single_mode_free/load", {})
+        except Exception as load_exc:
+            return {"success": False, "detail": f"career already active but resume failed: {load_exc}"}
+        chara = (result.get("data") or {}).get("chara_info")
+        if not chara:
+            return {"success": False, "detail": "start returned 102 but no active career found to resume"}
     return {"success": True, "result": result}
 
 
@@ -1767,6 +1783,10 @@ async def login(req: LoginRequest):
                     "name": chara_map.get(cid, f"Unknown ({cid})"),
                     "rank": chara.get("rank", 0),
                     "create_date": parse_chara_epoch(chara),
+                    # Lock / favorite flags — a locked or "saved" parent cannot be
+                    # released; the game rejects trained_chara/remove with error 102.
+                    "is_locked": int(chara.get("is_locked") or 0),
+                    "is_saved": int(chara.get("is_saved") or 0),
                     "tree": tree,
                 }
             )
@@ -2307,6 +2327,69 @@ def _evict_parents(ids: list):
         ]
 
 
+def _locked_parent_ids():
+    """Set of instance IDs that the game won't let us delete (locked/saved)."""
+    locked = set()
+    parents = (active_dashboard_data or {}).get("parents") or []
+    for p in parents:
+        if int(p.get("is_locked") or 0) or int(p.get("is_saved") or 0):
+            iid = int(p.get("instance_id") or 0)
+            if iid:
+                locked.add(iid)
+    return locked
+
+
+def _remove_parents_resilient(ids):
+    """Delete parents robustly.
+
+    The game's trained_chara/remove rejects the WHOLE batch with error 102 if even
+    one ID can't be released (locked / "saved" / the lent-out representative / a
+    parent bound to an active career). So we:
+      1) refresh session state once (stale sid is another 102 cause),
+      2) skip parents we know are locked,
+      3) try the batch; on failure, retry one ID at a time so the deletable ones
+         still go through and we can report exactly which IDs the server refuses.
+    Returns (removed_ids, failed[list of {id, detail}], skipped_locked_ids).
+    """
+    ids = [int(i) for i in ids]
+    # Do NOT pre-filter by is_locked/is_saved — those flags proved unreliable
+    # (the game auto-locks the lent-out representative, and is_saved is set on
+    # normal parents too). Let the game be the source of truth: attempt the
+    # delete and only report the IDs the server actually refuses.
+    skipped = []
+    targets = list(ids)
+    removed, failed = [], []
+    if not targets:
+        return removed, failed, skipped
+
+    # Refresh server-side state (a stale session also yields 102).
+    try:
+        active_client.call("load/index")
+    except Exception:
+        pass
+
+    # Fast path: one batch call.
+    try:
+        active_client.remove_trained_chara(targets)
+        removed = list(targets)
+        _evict_parents(removed)
+        return removed, failed, skipped
+    except Exception as batch_err:
+        # Batch rejected (likely one bad ID). Fall back to per-ID deletion.
+        if len(targets) == 1:
+            failed.append({"id": targets[0], "detail": str(batch_err)})
+            return removed, failed, skipped
+
+    for iid in targets:
+        try:
+            active_client.remove_trained_chara([iid])
+            removed.append(iid)
+            _evict_parents([iid])
+        except Exception as e:
+            failed.append({"id": iid, "detail": str(e)})
+    return removed, failed, skipped
+
+
 @app.post("/api/parents/remove")
 async def remove_parents(req: RemoveParentsRequest):
     """Delete one or more trained characters (parents) by instance ID."""
@@ -2317,11 +2400,37 @@ async def remove_parents(req: RemoveParentsRequest):
         return {"success": False, "detail": "No IDs provided"}
     ids = [int(i) for i in req.trained_chara_ids]
     try:
-        result = active_client.remove_trained_chara(ids)
-        _evict_parents(ids)
-        return {"success": True, "removed": len(ids), "result": result}
+        removed, failed, skipped = _remove_parents_resilient(ids)
     except Exception as e:
         return {"success": False, "detail": str(e)}
+
+    if not removed and (failed or skipped):
+        bits = []
+        if skipped:
+            bits.append(f"{len(skipped)} locked/saved (cannot be released)")
+        if failed:
+            bits.append(f"{len(failed)} rejected by game (error {_first_err_code(failed)})")
+        return {
+            "success": False,
+            "detail": "Could not delete: " + ", ".join(bits)
+            + ". Locked parents must be unlocked in-game; the lent-out representative can't be deleted.",
+            "removed_ids": removed, "failed": failed, "skipped_locked": skipped,
+        }
+    return {
+        "success": True,
+        "removed": len(removed),
+        "removed_ids": removed,
+        "failed": failed,
+        "skipped_locked": skipped,
+    }
+
+
+def _first_err_code(failed):
+    for f in failed:
+        m = re.search(r"\b(\d{3})\b", str(f.get("detail") or ""))
+        if m:
+            return m.group(1)
+    return "102"
 
 
 class RemoveRecentParentsRequest(BaseModel):
@@ -2354,11 +2463,26 @@ async def remove_recent_parents(req: RemoveRecentParentsRequest):
         return {"success": True, "removed": 0, "detail": "No parents found within the time window"}
 
     try:
-        result = active_client.remove_trained_chara(candidates)
-        _evict_parents(candidates)
-        return {"success": True, "removed": len(candidates), "ids": candidates, "result": result}
+        removed, failed, skipped = _remove_parents_resilient(candidates)
     except Exception as e:
         return {"success": False, "detail": str(e)}
+
+    detail = None
+    if skipped or failed:
+        bits = []
+        if skipped:
+            bits.append(f"{len(skipped)} locked/saved skipped")
+        if failed:
+            bits.append(f"{len(failed)} rejected by game (error {_first_err_code(failed)})")
+        detail = "; ".join(bits)
+    return {
+        "success": True,
+        "removed": len(removed),
+        "ids": removed,
+        "failed": failed,
+        "skipped_locked": skipped,
+        "detail": detail,
+    }
 
 
 @app.get("/api/debug/parent_times")
@@ -2378,11 +2502,22 @@ async def debug_parent_times():
             "name": p.get("name"),
             "create_date": cd,
             "created_utc": (_dt.datetime.utcfromtimestamp(cd).isoformat() if cd else None),
+            "is_locked": p.get("is_locked"),
+            "is_saved": p.get("is_saved"),
         })
+    # Parents carrying either flag — useful when a delete is refused.
+    flagged = [
+        {"instance_id": p.get("instance_id"), "name": p.get("name"),
+         "is_locked": p.get("is_locked"), "is_saved": p.get("is_saved")}
+        for p in parents
+        if int(p.get("is_locked") or 0) or int(p.get("is_saved") or 0)
+    ]
     return {
         "logged_in": active_dashboard_data is not None,
         "parent_count": len(parents),
         "parents_with_create_date": len(nonzero),
+        "flagged_locked_or_saved_count": len(flagged),
+        "flagged_locked_or_saved": flagged[:20],
         "first_parent_raw": _LAST_PARENT_TIME_DEBUG,
         "sample": sample,
     }

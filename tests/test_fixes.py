@@ -247,3 +247,59 @@ def test_race_entry_event_drain_394_recovers():
             return 1
     out = r._race(C(), {"data": {}}, {"scenario_id": 4}, {"program_id": 7, "current_turn": 60, "_strategy": S()})
     assert out is fresh, "should refresh instead of crashing on 394"
+
+# ---------- Regression: the 2026-06-17 crash (205 during event drain) ----------
+
+def test_drain_events_recovers_on_205():
+    """Exact crash: _drain_events -> _event -> check_event raises 205.
+    Must refresh state and continue instead of propagating (RUNNER CRASH)."""
+    r = make_runner()
+    fresh = {"data": {"chara_info": {"turn": 61, "playing_state": 1}}}  # no unchecked events
+    calls = {"check": 0, "load": 0}
+    class C:
+        api_jitter = 0.0
+        def check_event(self, **kw):
+            calls["check"] += 1
+            raise Exception("API error 205 on single_mode_free/check_event")
+        def load_career(self):
+            calls["load"] += 1
+            return fresh
+    class S:
+        def _choice(self, e):
+            return 1
+        def choose_from_event(self, e, t):
+            return 1
+    state = {"data": {"chara_info": {"turn": 60},
+                      "unchecked_event_array": [{"event_id": 1, "chara_id": 0}]}}
+    out = r._drain_events(C(), S(), state)
+    assert out is fresh, "drain must refresh state on 205 instead of raising"
+    assert calls["load"] >= 1, "recovery should reload career state"
+
+def test_drain_events_no_recover_flag_propagates():
+    """With recover=False (the call from _fresh_career_state), a transient error
+    must propagate so it cannot recurse infinitely into _fresh_career_state."""
+    r = make_runner()
+    class C:
+        api_jitter = 0.0
+        def check_event(self, **kw):
+            raise Exception("API error 205 on single_mode_free/check_event")
+    class S:
+        def _choice(self, e):
+            return 1
+        def choose_from_event(self, e, t):
+            return 1
+    state = {"data": {"chara_info": {"turn": 60},
+                      "unchecked_event_array": [{"event_id": 1, "chara_id": 0}]}}
+    raised = False
+    try:
+        r._drain_events(C(), S(), state, recover=False)
+    except Exception:
+        raised = True
+    assert raised, "recover=False must propagate to avoid infinite recursion"
+
+def test_call_205_extended_budget_survives_burst():
+    """Fix 3: 4 consecutive 205s (old budget was 3 -> would raise) now tolerated."""
+    c = make_client()
+    res, seq = run_call(c, [FakeResp()], [205, 205, 205, 205, 1])
+    assert res["data_headers"]["result_code"] == 1
+    assert seq["j"] == 5

@@ -273,7 +273,7 @@ class CareerRunner:
                         state = client.exec_command(**decision.payload)
                         data = state.get("data") or {}
                         if data.get("unchecked_event_array"):
-                            state = self._drain_events(client, strategy, state)
+                            state = self._drain_events(client, strategy, state, recover=False)
                     except Exception as exc:
                         if any(tok in str(exc) for tok in ("Network error", "201", "205", "208", "394")):
                             state = self._fresh_career_state(client, strategy)
@@ -298,7 +298,16 @@ class CareerRunner:
                 elif decision.action == "race":
 
                     self._record_action(decision, chara)
-                    state = self._race(client, state, preset, decision.payload)
+                    try:
+                        state = self._race(client, state, preset, decision.payload)
+                    except Exception as exc:
+                        # Backstop: a transient server error anywhere inside the
+                        # race flow must refresh state, not crash the run.
+                        if not any(tok in str(exc) for tok in ("Network error", "201", "205", "208", "394")):
+                            raise
+                        self._log("race_recover", turn, f"race failed ({str(exc)[:60]}), refreshing state")
+                        state = self._fresh_career_state(client, strategy)
+                        continue
                 elif decision.action == "race_progress":
                     # guard against endless resume loops on the same turn
                     if rp_guard["turn"] == turn:
@@ -758,7 +767,7 @@ class CareerRunner:
                 else:
                     state = client.call("single_mode_free/load", {})
                 if strategy and (state.get("data") or {}).get("unchecked_event_array"):
-                    state = self._drain_events(client, strategy, state)
+                    state = self._drain_events(client, strategy, state, recover=False)
                 self.skill_buyer.reset_scoped_failures()
                 self.item_manager.reset_scoped_failures()
                 return state
@@ -789,8 +798,9 @@ class CareerRunner:
             return self._fresh_career_state(client, strategy)
         return client.check_event(**data)
 
-    def _drain_events(self, client, strategy, state, limit=20):
+    def _drain_events(self, client, strategy, state, limit=20, recover=True):
         current = state
+        recover_left = 3
         for _ in range(limit):
             data = current.get("data") or {}
             events = data.get("unchecked_event_array") or []
@@ -803,7 +813,21 @@ class CareerRunner:
             payload = {"event_id": event.get("event_id"), "chara_id": event.get("chara_id", 0), "choice_number": choice, "current_turn": turn}
             if choice is None:
                 payload = {"event_id": event.get("event_id"), "_event": event, "_current_turn": turn}
-            current = self._event(client, strategy, payload)
+            try:
+                current = self._event(client, strategy, payload)
+            except Exception as exc:
+                # A transient server error (504/205/208/...) while draining events
+                # must NOT crash the whole run. 205/208 do not always mean the
+                # event failed server-side, so refresh state and re-read the
+                # unchecked_event_array instead of propagating. recover=False is
+                # passed from _fresh_career_state to avoid infinite recursion.
+                if not recover or recover_left <= 0 or not any(
+                    tok in str(exc) for tok in ("Network error", "201", "205", "208", "394")
+                ):
+                    raise
+                recover_left -= 1
+                self._log("event_drain_recover", turn, f"event drain failed ({str(exc)[:60]}), refreshing state")
+                current = self._fresh_career_state(client, strategy)
         return current
 
     def _get_clocks_left(self, root, max_clocks=5):
@@ -951,7 +975,7 @@ class CareerRunner:
             entry_data = entry.get("data") or {}
             if entry_data.get("unchecked_event_array"):
                 try:
-                    entry = self._drain_events(client, strategy, entry)
+                    entry = self._drain_events(client, strategy, entry, recover=False)
                 except Exception as exc:
                     if not any(tok in str(exc) for tok in ("Network error", "201", "205", "208", "394")):
                         raise
@@ -991,7 +1015,7 @@ class CareerRunner:
 
                 if strategy:
                     if cont_data.get("unchecked_event_array"):
-                        self._drain_events(client, strategy, cont_res)
+                        self._drain_events(client, strategy, cont_res, recover=False)
                 
                 roll = dna_gauss(0.166 + client.api_jitter, 0.05)
                 dna_sleep(0.1, 0.45, 0.166 + client.api_jitter, 0.05)

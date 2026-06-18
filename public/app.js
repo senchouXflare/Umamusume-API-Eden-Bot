@@ -2349,19 +2349,32 @@ const els = {
                     body: JSON.stringify({trained_chara_ids: ids})
                 });
                 const data = await res.json();
-                if (data.success) {
-                    const idSet = new Set(ids);
+                // Only the IDs the server actually removed should disappear.
+                const removedIds = Array.isArray(data.removed_ids) ? data.removed_ids.map(Number) : (data.success ? ids.map(Number) : []);
+                if (removedIds.length) {
+                    const idSet = new Set(removedIds);
                     if (dashData.parents) dashData.parents = dashData.parents.filter(p => !idSet.has(Number(p.instance_id)));
                     selection.veterans = selection.veterans.filter(v => !idSet.has(Number(v.instance_id)));
                     renderTeamPanel();
                     (cards || []).forEach(card => {
+                        const cid = Number(card.dataset.instanceId);
+                        if (!idSet.has(cid)) return;
                         card.style.transition = 'opacity 0.25s';
                         card.style.opacity = '0';
                         setTimeout(() => card.remove(), 260);
                     });
-                } else {
+                }
+                // Surface anything the game refused (locked / saved / representative / in-use).
+                const problems = [];
+                if (Array.isArray(data.skipped_locked) && data.skipped_locked.length) problems.push(`${data.skipped_locked.length} locked/saved (unlock in-game first)`);
+                if (Array.isArray(data.failed) && data.failed.length) problems.push(`${data.failed.length} refused by game (locked, the lent-out rep, or in an active career)`);
+                if (problems.length) {
+                    alert((removedIds.length ? `Deleted ${removedIds.length}. ` : '') + 'Could not delete ' + problems.join(' and ') + '.');
+                } else if (!data.success && !removedIds.length) {
                     alert('Delete failed: ' + (data.detail || 'unknown error'));
-                    if (triggerEl) { triggerEl.disabled = false; triggerEl.innerHTML = '&#128465;'; }
+                }
+                if ((!data.success || (data.failed && data.failed.length)) && triggerEl) {
+                    triggerEl.disabled = false; triggerEl.innerHTML = '&#128465;';
                 }
             } catch (err) {
                 alert('Delete failed: ' + err.message);
